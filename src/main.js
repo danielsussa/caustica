@@ -113,11 +113,58 @@ const floor    = planeGrid([-3, -1, -3], [6, 0, 0], [0, 0, 5]);
 const backWall = planeGrid([-3, -1, -3], [6, 0, 0], [0, 4, 0]);
 const leftWall = planeGrid([-3, -1, -3], [0, 0, 5], [0, 4, 0]);
 
+// esfera tesselada por lat/lon. tris cobrem a superfície; edges desenham
+// alguns paralelos e meridianos pra dar a "globo" no wireframe.
+function sphereGeom(center, radius, latSegs = 12, lonSegs = 16) {
+  const verts = [];
+  const tris = [];
+  const edges = [];
+  for (let i = 0; i <= latSegs; i++) {
+    const lat = -Math.PI / 2 + (i * Math.PI) / latSegs;
+    const cy = Math.sin(lat);
+    const cr = Math.cos(lat);
+    for (let j = 0; j < lonSegs; j++) {
+      const lon = (j * 2 * Math.PI) / lonSegs;
+      verts.push([
+        center[0] + radius * cr * Math.cos(lon),
+        center[1] + radius * cy,
+        center[2] + radius * cr * Math.sin(lon),
+      ]);
+    }
+  }
+  for (let i = 0; i < latSegs; i++) {
+    for (let j = 0; j < lonSegs; j++) {
+      const j2 = (j + 1) % lonSegs;
+      const a = i * lonSegs + j;
+      const b = i * lonSegs + j2;
+      const c = (i + 1) * lonSegs + j;
+      const d = (i + 1) * lonSegs + j2;
+      tris.push([a, b, d]);
+      tris.push([a, d, c]);
+    }
+  }
+  // wireframe: 1 paralelo a cada 3 anéis, 1 meridiano a cada 2 colunas
+  for (let i = 3; i < latSegs; i += 3) {
+    for (let j = 0; j < lonSegs; j++) {
+      edges.push([i * lonSegs + j, i * lonSegs + ((j + 1) % lonSegs)]);
+    }
+  }
+  for (let j = 0; j < lonSegs; j += 2) {
+    for (let i = 0; i < latSegs; i++) {
+      edges.push([i * lonSegs + j, (i + 1) * lonSegs + j]);
+    }
+  }
+  return { verts, edges, tris };
+}
+
+const lightVis = sphereGeom(lightSphere.c, lightSphere.r, 12, 16);
+
 const scene = [
   { ...cube,     rgb: [120, 170, 255] },
   { ...floor,    rgb: [80, 180, 130]  },
   { ...backWall, rgb: [200, 90, 90]   },
   { ...leftWall, rgb: [200, 200, 80]  },
+  { ...lightVis, rgb: [255, 230, 150], emissive: true },
 ];
 
 // luz fixa em view space (sente como uma luz no canto superior frontal)
@@ -233,8 +280,13 @@ function drawShaded(view) {
       const nz = e1x*e2y - e1y*e2x;
       const len = Math.hypot(nx, ny, nz);
       if (len < 1e-9) continue;
-      const ndotl = Math.abs((nx*LIGHT[0] + ny*LIGHT[1] + nz*LIGHT[2]) / len);
-      const intensity = 0.2 + 0.8 * ndotl;
+      let intensity;
+      if (obj.emissive) {
+        intensity = 1;
+      } else {
+        const ndotl = Math.abs((nx*LIGHT[0] + ny*LIGHT[1] + nz*LIGHT[2]) / len);
+        intensity = 0.2 + 0.8 * ndotl;
+      }
 
       const r = Math.min(255, br * intensity) | 0;
       const g = Math.min(255, bg * intensity) | 0;
@@ -248,7 +300,7 @@ function drawShaded(view) {
 }
 
 // ---------- estado / interação ----------
-import { startPathTracer, stopPathTracer } from './raytrace.js';
+import { startPathTracer, stopPathTracer, lightSphere } from './raytrace.js';
 
 let mode = 'wireframe';      // wireframe | shaded | pathtrace
 let prevMode = 'wireframe';  // pra voltar quando sair do PT

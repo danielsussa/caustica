@@ -19,14 +19,22 @@ const norm = a => {
   return [a[0]/l, a[1]/l, a[2]/l];
 };
 
-// ---------- materiais (cores casadas com o rasterizador) ----------
-const matCube  = { albedo: [120/255, 170/255, 240/255] };
-const matFloor = { albedo: [ 80/255, 180/255, 130/255] };
-const matBack  = { albedo: [200/255,  90/255,  90/255] };
-const matLeft  = { albedo: [200/255, 200/255,  80/255] };
+// ---------- materiais ----------
+const M_DIFFUSE = 0;
+const M_LIGHT   = 1;
+
+const matCube  = { kind: M_DIFFUSE, albedo: [120/255, 170/255, 240/255] };
+const matFloor = { kind: M_DIFFUSE, albedo: [ 80/255, 180/255, 130/255] };
+const matBack  = { kind: M_DIFFUSE, albedo: [200/255,  90/255,  90/255] };
+const matLeft  = { kind: M_DIFFUSE, albedo: [200/255, 200/255,  80/255] };
+const matLight = { kind: M_LIGHT,   emission: [40, 36, 28] };
 
 // ---------- cena ----------
 const tris = [];
+
+// luz: esfera emissiva acima da cena (visível como lâmpada)
+export const lightSphere = { c: [0.5, 3.5, 0.3], r: 0.25 };
+const lightArea = 4 * Math.PI * lightSphere.r * lightSphere.r;
 
 function addQuad(p0, p1, p2, p3, mat) {
   const n = norm(cross(sub(p1, p0), sub(p2, p0)));
@@ -73,6 +81,18 @@ function intersectTri(tri, ro, rd) {
   return t > 1e-4 ? t : Infinity;
 }
 
+function intersectSphere(s, ro, rd) {
+  const ocx = ro[0]-s.c[0], ocy = ro[1]-s.c[1], ocz = ro[2]-s.c[2];
+  const b = ocx*rd[0] + ocy*rd[1] + ocz*rd[2];
+  const c = ocx*ocx + ocy*ocy + ocz*ocz - s.r*s.r;
+  const disc = b*b - c;
+  if (disc < 0) return Infinity;
+  const sd = Math.sqrt(disc);
+  let t = -b - sd;
+  if (t < 1e-4) t = -b + sd;
+  return t > 1e-4 ? t : Infinity;
+}
+
 function intersectScene(ro, rd) {
   let tMin = Infinity;
   let mat = null;
@@ -81,7 +101,23 @@ function intersectScene(ro, rd) {
     const t = intersectTri(tris[i], ro, rd);
     if (t < tMin) { tMin = t; mat = tris[i].mat; n = tris[i].n; }
   }
+  const tL = intersectSphere(lightSphere, ro, rd);
+  if (tL < tMin) {
+    tMin = tL;
+    mat = matLight;
+    const px = ro[0] + tL*rd[0], py = ro[1] + tL*rd[1], pz = ro[2] + tL*rd[2];
+    n = norm([px - lightSphere.c[0], py - lightSphere.c[1], pz - lightSphere.c[2]]);
+  }
   return { t: tMin, mat, n };
+}
+
+// shadow ray: só testa triângulos opacos (ignora a esfera de luz)
+function occluded(ro, rd, maxT) {
+  for (let i = 0; i < tris.length; i++) {
+    const t = intersectTri(tris[i], ro, rd);
+    if (t < maxT) return true;
+  }
+  return false;
 }
 
 // ---------- sampling ----------
@@ -104,32 +140,61 @@ function sampleCosineHemisphere(n) {
   ];
 }
 
-// ---------- iluminação: céu + sol concentrado ----------
-const SUN = norm([0.4, 0.7, 0.6]);
+// ---------- iluminação direta (Next Event Estimation) ----------
+// A cada bounce difusa, sorteamos um ponto na esfera de luz, testamos
+// visibilidade com shadow ray, e somamos a contribuição. Sem isso, com
+// fundo preto e luz pequena, a chance de uma bounce aleatória achar a
+// luz é mínima — convergência levaria horas.
+function directLight(p, n, albedo) {
+  // ponto uniforme na superfície da esfera
+  const u1 = Math.random();
+  const u2 = Math.random();
+  const z = 1 - 2 * u1;
+  const r = Math.sqrt(Math.max(0, 1 - z*z));
+  const phi = 2 * Math.PI * u2;
+  const lnx = r * Math.cos(phi), lny = z, lnz = r * Math.sin(phi);
+  const lpx = lightSphere.c[0] + lightSphere.r * lnx;
+  const lpy = lightSphere.c[1] + lightSphere.r * lny;
+  const lpz = lightSphere.c[2] + lightSphere.r * lnz;
 
-function skyEmission(rd) {
-  const t = rd[1] * 0.5 + 0.5;
-  let r = (1-t) * 1.05 + t * 0.45;
-  let g = (1-t) * 1.00 + t * 0.65;
-  let b = (1-t) * 0.85 + t * 1.10;
-  const d = rd[0]*SUN[0] + rd[1]*SUN[1] + rd[2]*SUN[2];
-  if (d > 0) {
-    const k = Math.pow(d, 64) * 25;
-    r += k;
-    g += k * 0.95;
-    b += k * 0.85;
-  }
-  return [r, g, b];
+  const dx = lpx - p[0], dy = lpy - p[1], dz = lpz - p[2];
+  const distSq = dx*dx + dy*dy + dz*dz;
+  const dist = Math.sqrt(distSq);
+  const wx = dx / dist, wy = dy / dist, wz = dz / dist;
+
+  const cosSurf = n[0]*wx + n[1]*wy + n[2]*wz;
+  if (cosSurf <= 0) return [0, 0, 0];
+  const cosLight = -(lnx*wx + lny*wy + lnz*wz);
+  if (cosLight <= 0) return [0, 0, 0]; // ponto está no lado oculto da esfera
+
+  if (occluded(p, [wx, wy, wz], dist - 1e-3)) return [0, 0, 0];
+
+  // estimador MC: Le * BRDF * cos_x * cos_y * area / dist²
+  // BRDF lambertiano = albedo / π
+  const factor = (lightArea * cosSurf * cosLight) / (Math.PI * distSq);
+  const Le = matLight.emission;
+  return [
+    albedo[0] * Le[0] * factor,
+    albedo[1] * Le[1] * factor,
+    albedo[2] * Le[2] * factor,
+  ];
 }
 
 // ---------- path tracer ----------
 const MAX_DEPTH = 6;
 
-function trace(ro, rd, depth) {
+// includeEmission: true só quando o raio veio direto da câmera (ou bounce
+// especular). Em raios que vieram de bounce difusa, NEE já contou a luz,
+// então retornar emission aqui causaria contagem dupla.
+function trace(ro, rd, depth, includeEmission) {
   if (depth >= MAX_DEPTH) return [0, 0, 0];
 
   const { t, mat, n: rawN } = intersectScene(ro, rd);
-  if (!mat) return skyEmission(rd);
+  if (!mat) return [0, 0, 0]; // fundo preto
+
+  if (mat.kind === M_LIGHT) {
+    return includeEmission ? mat.emission : [0, 0, 0];
+  }
 
   const hp = [ro[0] + t*rd[0], ro[1] + t*rd[1], ro[2] + t*rd[2]];
   let n = rawN;
@@ -137,12 +202,14 @@ function trace(ro, rd, depth) {
   const eps = 1e-4;
   const start = [hp[0] + n[0]*eps, hp[1] + n[1]*eps, hp[2] + n[2]*eps];
 
+  const direct = directLight(start, n, mat.albedo);
+
   const dir = sampleCosineHemisphere(n);
-  const inc = trace(start, dir, depth + 1);
+  const inc = trace(start, dir, depth + 1, false);
   return [
-    mat.albedo[0] * inc[0],
-    mat.albedo[1] * inc[1],
-    mat.albedo[2] * inc[2],
+    direct[0] + mat.albedo[0] * inc[0],
+    direct[1] + mat.albedo[1] * inc[1],
+    direct[2] + mat.albedo[2] * inc[2],
   ];
 }
 
@@ -177,7 +244,7 @@ export function startPathTracer({ canvas, ctx, sampleEl, camera }) {
         fwd[1] + u*right[1] + v*up[1],
         fwd[2] + u*right[2] + v*up[2],
       ]);
-      const c = trace(pos, dir, 0);
+      const c = trace(pos, dir, 0, true);
       const i = (y * W + x) * 3;
       accum[i+0] += c[0];
       accum[i+1] += c[1];
