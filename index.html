@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8" />
+<title>3D Render — experimento</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font-family: monospace; }
+  #screen { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 12px; bottom: 12px;
+    font-size: 12px; opacity: 0.6; pointer-events: none;
+  }
+  .hud a { pointer-events: auto; }
+</style>
+</head>
+<body>
+  <canvas id="screen"></canvas>
+  <div class="hud">
+    modo: <span id="mode-label">wireframe</span> · <b>M</b> wireframe/shaded · <b>R</b> path tracer · arraste pra rotacionar<span id="samples-info" style="display:none"> · samples: <b id="samples">0</b></span>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
