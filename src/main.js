@@ -2,18 +2,14 @@ const canvas = document.getElementById('screen');
 const ctx = canvas.getContext('2d');
 const modeLabel = document.getElementById('mode-label');
 let W = 0, H = 0, aspect = 1;
-let inPathTrace = false;
-let lightTraceDirty = true;
 
 function resize() {
-  if (inPathTrace) return; // PT controla seu próprio canvas
   W = window.innerWidth;
   H = window.innerHeight;
   canvas.width = W;
   canvas.height = H;
   aspect = W / H;
   imageData = null; // força recriar buffer
-  lightTraceDirty = true;
 }
 let imageData = null, u32 = null, zbuf = null;
 function ensureBuffers() {
@@ -61,25 +57,29 @@ const translate = (x, y, z) => [
 ];
 
 // ---------- geometria ----------
-const cube = {
-  verts: [
-    [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
-    [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],
-  ],
-  edges: [
-    [0,1],[1,2],[2,3],[3,0],
-    [4,5],[5,6],[6,7],[7,4],
-    [0,4],[1,5],[2,6],[3,7],
-  ],
-  tris: [
-    [0,3,2],[0,2,1],          // -z
-    [4,5,6],[4,6,7],          // +z
-    [0,1,5],[0,5,4],          // -y
-    [3,7,6],[3,6,2],          // +y
-    [0,4,7],[0,7,3],          // -x
-    [1,2,6],[1,6,5],          // +x
-  ],
-};
+function boxGeom(min, max) {
+  const [x0, y0, z0] = min;
+  const [x1, y1, z1] = max;
+  return {
+    verts: [
+      [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+      [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+    ],
+    edges: [
+      [0,1],[1,2],[2,3],[3,0],
+      [4,5],[5,6],[6,7],[7,4],
+      [0,4],[1,5],[2,6],[3,7],
+    ],
+    tris: [
+      [0,3,2],[0,2,1],
+      [4,5,6],[4,6,7],
+      [0,1,5],[0,5,4],
+      [3,7,6],[3,6,2],
+      [0,4,7],[0,7,3],
+      [1,2,6],[1,6,5],
+    ],
+  };
+}
 
 // plano com 4 cantos (pra tris) + grade de linhas internas (pra wireframe)
 function planeGrid(origin, uVec, vVec, divs = 6) {
@@ -111,9 +111,7 @@ function planeGrid(origin, uVec, vVec, divs = 6) {
   return { verts, edges, tris };
 }
 
-const floor    = planeGrid([-3, -1, -3], [6, 0, 0], [0, 0, 5]);
-const backWall = planeGrid([-3, -1, -3], [6, 0, 0], [0, 4, 0]);
-const leftWall = planeGrid([-3, -1, -3], [0, 0, 5], [0, 4, 0]);
+// nada aqui — a cena é montada abaixo a partir de rooms[]
 
 // esfera tesselada por lat/lon. tris cobrem a superfície; edges desenham
 // alguns paralelos e meridianos pra dar a "globo" no wireframe.
@@ -159,15 +157,43 @@ function sphereGeom(center, radius, latSegs = 12, lonSegs = 16) {
   return { verts, edges, tris };
 }
 
-const lightVis = sphereGeom(lightSphere.c, lightSphere.r, 12, 16);
+// converte um quad (4 cantos) num scene entry (verts/edges/tris/rgb)
+function quadEntry(q) {
+  return {
+    verts: [q.p0, q.p1, q.p2, q.p3],
+    edges: [[0,1],[1,2],[2,3],[3,0]],
+    tris:  [[0,1,2],[0,2,3]],
+    rgb:   q.rgb,
+  };
+}
 
-const scene = [
-  { ...cube,     rgb: [120, 170, 255] },
-  { ...floor,    rgb: [80, 180, 130]  },
-  { ...backWall, rgb: [200, 90, 90]   },
-  { ...leftWall, rgb: [200, 200, 80]  },
-  { ...lightVis, rgb: [255, 230, 150], emissive: true },
-];
+// monta a cena raster a partir de todos os cômodos. Cada entry é taggeada
+// com roomId (filtragem) e kind + dados raw (silhouette mode usa).
+const scene = [];
+for (const room of rooms) {
+  const rid = room.id;
+  for (const q of room.visual.quads) {
+    scene.push({ ...quadEntry(q), roomId: rid, kind: 'quad' });
+  }
+  for (const b of room.visual.boxes) {
+    scene.push({
+      ...boxGeom(b.min, b.max), rgb: b.rgb, roomId: rid,
+      kind: 'box', boxMin: b.min, boxMax: b.max,
+    });
+  }
+  for (const s of room.visual.spheres) {
+    scene.push({
+      ...sphereGeom(s.c, s.r, 12, 16), rgb: s.rgb, roomId: rid,
+      kind: 'sphere', sphCenter: s.c, sphRadius: s.r,
+    });
+  }
+  for (const l of room.visual.lights) {
+    scene.push({
+      ...sphereGeom(l.c, l.r, 10, 14), rgb: l.rgb, emissive: true, roomId: rid,
+      kind: 'sphere', sphCenter: l.c, sphRadius: l.r,
+    });
+  }
+}
 
 // luz fixa em view space (sente como uma luz no canto superior frontal)
 const LIGHT = (() => {
@@ -260,14 +286,153 @@ function drawWireframe(view) {
   }
 }
 
-// canvas em lighttrace acumula. lightTraceDirty é setado quando precisamos
-// limpar e redesenhar o wireframe (entrada no modo, rotação, resize).
+// Ring buffer de caminhos de fóton em world space. Cada frame projeta tudo
+// e desenha em 4 strokes batched (um por nível de bounce → 4 alphas distintos).
+// Caminhos sobrevivem rotação porque ficam em world space — re-projetamos
+// a cada frame com a view atual.
+const MAX_PATHS = 8000;
+const MAX_POINTS = 5;          // 1 ponto na luz + até 4 hits
+const photonXYZ       = new Float32Array(MAX_PATHS * MAX_POINTS * 3);
+const photonRGB       = new Float32Array(MAX_PATHS * MAX_POINTS * 3); // cor 0-1 por ponto
+const photonIntensity = new Float32Array(MAX_PATHS * MAX_POINTS);     // energia carregada
+const photonLen       = new Uint8Array(MAX_PATHS);
+let photonHead = 0;
+let photonCount = 0;
+
+// parâmetros ajustáveis via sliders / toggles
+let ltPathsPerFrame = 40;
+let ltAlphaBase     = 0.05;
+let ltAlphaDecay    = 0.45;
+let ltMaxBounces    = 4;
+let ltShowWireframe = false;
+let ltSplats        = true;
+let ltFog           = true;
+let ltColorByBounce = false;
+let ltLineFirstOnly = false;
+let ltGaussian      = false;
+let ltContoursIntensity = 0; // 0 = off, 1 = max
+let ltPhysicalDecay = false;
+let ltEmissionVar   = 0;     // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
+const FOG_STRENGTH        = 0.06;
+const N_FOG_BUCKETS       = 4;
+const N_INTENSITY_BUCKETS = 8;
+
+function appendPhotonPath(pts, cols, intensities) {
+  const slot = photonHead;
+  const n = Math.min(pts.length, MAX_POINTS);
+  const base = slot * MAX_POINTS * 3;
+  const ibase = slot * MAX_POINTS;
+  for (let i = 0; i < n; i++) {
+    const o = base + i*3;
+    photonXYZ[o]   = pts[i][0];   photonRGB[o]   = cols[i][0];
+    photonXYZ[o+1] = pts[i][1];   photonRGB[o+1] = cols[i][1];
+    photonXYZ[o+2] = pts[i][2];   photonRGB[o+2] = cols[i][2];
+    photonIntensity[ibase + i] = intensities[i];
+  }
+  photonLen[slot] = n;
+  photonHead = (photonHead + 1) % MAX_PATHS;
+  if (photonCount < MAX_PATHS) photonCount++;
+}
+
+// scratch pra projeção (alocado uma vez)
+const projX = new Float32Array(MAX_PATHS * MAX_POINTS);
+const projY = new Float32Array(MAX_PATHS * MAX_POINTS);
+const projFog = new Float32Array(MAX_PATHS * MAX_POINTS);
+const projValid = new Uint8Array(MAX_PATHS * MAX_POINTS);
+
+// reusado entre frames: mapa de bucket key → array de coords. Crescer mas
+// nunca encolher. Em prática ~80 entries.
+const segmentBuckets = new Map();
+
+// silhouette de box: arestas entre face front-facing e back-facing.
+// edgeFaces: cada entry [v0, v1, fa, fb] onde v0/v1 são índices de vértice
+// (boxGeom convention) e fa/fb são índices de face: 0=-x, 1=+x, 2=-y, 3=+y, 4=-z, 5=+z
+const BOX_EDGE_FACES = [
+  [0, 1, 2, 4], [1, 5, 2, 1], [5, 4, 2, 5], [4, 0, 2, 0],
+  [3, 2, 3, 4], [2, 6, 3, 1], [6, 7, 3, 5], [7, 3, 3, 0],
+  [0, 3, 0, 4], [1, 2, 1, 4], [5, 6, 1, 5], [4, 7, 0, 5],
+];
+
+function drawBoxContour(view, boxMin, boxMax) {
+  const verts = [
+    [boxMin[0], boxMin[1], boxMin[2]], [boxMax[0], boxMin[1], boxMin[2]],
+    [boxMax[0], boxMax[1], boxMin[2]], [boxMin[0], boxMax[1], boxMin[2]],
+    [boxMin[0], boxMin[1], boxMax[2]], [boxMax[0], boxMin[1], boxMax[2]],
+    [boxMax[0], boxMax[1], boxMax[2]], [boxMin[0], boxMax[1], boxMax[2]],
+  ];
+  const projected = verts.map(p => {
+    const v = matVec(view, [p[0], p[1], p[2], 1]);
+    return project(v);
+  });
+  const fc = [
+    camPos[0] < boxMin[0], camPos[0] > boxMax[0],
+    camPos[1] < boxMin[1], camPos[1] > boxMax[1],
+    camPos[2] < boxMin[2], camPos[2] > boxMax[2],
+  ];
+  ctx.beginPath();
+  for (const [v0, v1, fa, fb] of BOX_EDGE_FACES) {
+    if (fc[fa] === fc[fb]) continue; // ambas visíveis ou ambas ocultas → não silhouette
+    const pa = projected[v0], pb = projected[v1];
+    if (!pa || !pb) continue;
+    ctx.moveTo(pa[0], pa[1]);
+    ctx.lineTo(pb[0], pb[1]);
+  }
+  ctx.stroke();
+}
+
+function drawSphereContour(view, center, radius) {
+  const v = matVec(view, [center[0], center[1], center[2], 1]);
+  const w = -v[2];
+  if (w <= radius) return; // câmera dentro/atrás
+  const sx = ((f / aspect) * v[0] / w * 0.5 + 0.5) * W;
+  const sy = (1 - (f * v[1] / w * 0.5 + 0.5)) * H;
+  const screenR = f * radius / w * H * 0.5;
+  ctx.beginPath();
+  ctx.arc(sx, sy, screenR, 0, 2 * Math.PI);
+  ctx.stroke();
+}
+
+// cache de splat gaussiano por cor RGB. Calculado preguiçosamente.
+const gaussianCache = new Map();
+function gaussianSplatCanvas(r, g, b) {
+  const key = (r << 16) | (g << 8) | b;
+  let canvas = gaussianCache.get(key);
+  if (canvas) return canvas;
+  const SIZE = 9;
+  canvas = document.createElement('canvas');
+  canvas.width = canvas.height = SIZE;
+  const cx = canvas.getContext('2d');
+  const img = cx.createImageData(SIZE, SIZE);
+  const data = img.data;
+  const center = SIZE / 2;
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const dx = x - center + 0.5;
+      const dy = y - center + 0.5;
+      const d2 = (dx*dx + dy*dy) / (center * center);
+      const intensity = Math.exp(-d2 * 3.5);
+      const i = (y * SIZE + x) * 4;
+      data[i]     = r;
+      data[i + 1] = g;
+      data[i + 2] = b;
+      data[i + 3] = (intensity * 255) | 0;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+  gaussianCache.set(key, canvas);
+  return canvas;
+}
+
 function drawLightTrace(view) {
-  if (lightTraceDirty) {
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, H);
-    ctx.lineWidth = 1;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  // wireframe (incluindo a esfera de luz) só quando ltShowWireframe.
+  const activeId = getActiveRoomId();
+  ctx.lineWidth = 1;
+  if (ltShowWireframe) {
     for (const obj of scene) {
+      if (obj.roomId !== activeId) continue;
       const projected = obj.verts.map(p => {
         const v = matVec(view, [p[0], p[1], p[2], 1]);
         return project(v);
@@ -285,31 +450,163 @@ function drawLightTrace(view) {
       }
       ctx.stroke();
     }
-    lightTraceDirty = false;
+  }
+  if (ltContoursIntensity > 0) {
+    ctx.lineWidth = 1.2;
+    for (const obj of scene) {
+      if (obj.roomId !== activeId) continue;
+      const [r, g, b] = obj.rgb;
+      const a = (obj.emissive ? 0.85 : 0.5) * ltContoursIntensity;
+      ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
+      if (obj.kind === 'box') {
+        drawBoxContour(view, obj.boxMin, obj.boxMax);
+      } else if (obj.kind === 'sphere') {
+        drawSphereContour(view, obj.sphCenter, obj.sphRadius);
+      } else {
+        // quad: já é um retângulo, perímetro = contorno
+        const projected = obj.verts.map(p => {
+          const v = matVec(view, [p[0], p[1], p[2], 1]);
+          return project(v);
+        });
+        ctx.beginPath();
+        for (const [a, b2] of obj.edges) {
+          const pa = projected[a], pb = projected[b2];
+          if (!pa || !pb) continue;
+          ctx.moveTo(pa[0], pa[1]);
+          ctx.lineTo(pb[0], pb[1]);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.lineWidth = 1;
   }
 
-  // a cada frame sorteia N caminhos com alpha bem baixo —
-  // canvas vai acumulando, áreas com mais fluxo de luz ficam mais brilhantes
-  const N_TRACES = 40;
-  const MAX_BOUNCES = 4;
-  ctx.lineWidth = 1;
-  for (let i = 0; i < N_TRACES; i++) {
-    const path = tracePhotonPath(MAX_BOUNCES);
-    if (path.length < 2) continue;
-    const proj = path.map(p => {
-      const v = matVec(view, [p[0], p[1], p[2], 1]);
-      return project(v);
-    });
-    for (let s = 0; s < proj.length - 1; s++) {
-      const pa = proj[s], pb = proj[s+1];
-      if (!pa || !pb) continue;
-      const alpha = Math.pow(0.45, s) * 0.05;
-      ctx.strokeStyle = `rgba(255, 220, 140, ${alpha})`;
-      ctx.beginPath();
-      ctx.moveTo(pa[0], pa[1]);
-      ctx.lineTo(pb[0], pb[1]);
-      ctx.stroke();
+  // adiciona N caminhos novos no ring buffer
+  for (let i = 0; i < ltPathsPerFrame; i++) {
+    const p = tracePhotonPath(ltMaxBounces, ltEmissionVar, ltPhysicalDecay);
+    if (p.points.length >= 2) appendPhotonPath(p.points, p.colors, p.intensities);
+  }
+  const useIntensity = ltPhysicalDecay || ltEmissionVar > 0;
+  if (ltBufferEl) ltBufferEl.textContent = `${photonCount} / ${MAX_PATHS}`;
+
+  // projeta tudo do buffer (matVec + perspective divide inline)
+  const m00 = view[0][0], m01 = view[0][1], m02 = view[0][2], m03 = view[0][3];
+  const m10 = view[1][0], m11 = view[1][1], m12 = view[1][2], m13 = view[1][3];
+  const m20 = view[2][0], m21 = view[2][1], m22 = view[2][2], m23 = view[2][3];
+  const fxa = f / aspect;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
+
+  for (let pi = 0; pi < photonCount; pi++) {
+    const len = photonLen[pi];
+    const slotBase = pi * MAX_POINTS;
+    let off = slotBase * 3;
+    for (let i = 0; i < len; i++) {
+      const wx = photonXYZ[off++];
+      const wy = photonXYZ[off++];
+      const wz = photonXYZ[off++];
+      const cx = m00*wx + m01*wy + m02*wz + m03;
+      const cy = m10*wx + m11*wy + m12*wz + m13;
+      const cz = m20*wx + m21*wy + m22*wz + m23;
+      const w = -cz;
+      const idx = slotBase + i;
+      if (w <= 0) {
+        projValid[idx] = 0;
+      } else {
+        projX[idx] = (fxa * cx / w + 1) * halfW;
+        projY[idx] = (1 - f * cy / w) * halfH;
+        projFog[idx] = ltFog ? Math.exp(-w * FOG_STRENGTH) : 1;
+        projValid[idx] = 1;
+      }
     }
+  }
+
+  // strokes batched por (cor, bounce, fog, intensity). Quando ltPhysicalDecay
+  // é off, intensity bucket fica fixo em 0 — ainda batch-friendly. Quando on,
+  // adiciona dim de discretização (8 buckets) → ~160-640 strokes. Rápido.
+  for (const [, arr] of segmentBuckets) arr.length = 0;
+  const lineMaxB = ltLineFirstOnly ? Math.min(2, ltMaxBounces) : ltMaxBounces;
+  for (let pi = 0; pi < photonCount; pi++) {
+    const len = photonLen[pi];
+    const ibase = pi * MAX_POINTS;
+    for (let b = 0; b < lineMaxB; b++) {
+      if (b + 1 >= len) continue;
+      const i0 = pi * MAX_POINTS + b;
+      const i1 = i0 + 1;
+      if (!projValid[i0] || !projValid[i1]) continue;
+      let r, g, bl;
+      if (ltColorByBounce) {
+        const cidx = i0 * 3;
+        r  = (photonRGB[cidx]   * 255) | 0;
+        g  = (photonRGB[cidx+1] * 255) | 0;
+        bl = (photonRGB[cidx+2] * 255) | 0;
+      } else {
+        r = 255; g = 220; bl = 140;
+      }
+      const fogAvg = (projFog[i0] + projFog[i1]) * 0.5;
+      const fb = Math.min(N_FOG_BUCKETS - 1, (fogAvg * N_FOG_BUCKETS) | 0);
+      let ib = 0;
+      if (useIntensity) {
+        // intensidade durante este segmento = energia deixando ponto i0.
+        // clamp pra bucket válido (intensity pode ser > 1 com emission var)
+        const intensity = photonIntensity[ibase + b];
+        const ibIdx = (intensity * 0.5 * N_INTENSITY_BUCKETS) | 0; // mapeia [0,2] → [0,N)
+        ib = Math.max(0, Math.min(N_INTENSITY_BUCKETS - 1, ibIdx));
+      }
+      const key = `${r},${g},${bl},${b},${fb},${ib}`;
+      let arr = segmentBuckets.get(key);
+      if (!arr) segmentBuckets.set(key, arr = []);
+      arr.push(projX[i0], projY[i0], projX[i1], projY[i1]);
+    }
+  }
+  ctx.lineWidth = 1;
+  for (const [key, segs] of segmentBuckets) {
+    if (segs.length === 0) continue;
+    const [r, g, bl, b, fb, ib] = key.split(',');
+    const baseAlpha = Math.pow(ltAlphaDecay, +b) * ltAlphaBase;
+    const fogMul = (+fb + 0.5) / N_FOG_BUCKETS;
+    const intensityMul = useIntensity ? (+ib + 0.5) * 2 / N_INTENSITY_BUCKETS : 1;
+    ctx.strokeStyle = `rgba(${r},${g},${bl},${baseAlpha * fogMul * intensityMul})`;
+    ctx.beginPath();
+    for (let i = 0; i < segs.length; i += 4) {
+      ctx.moveTo(segs[i], segs[i+1]);
+      ctx.lineTo(segs[i+2], segs[i+3]);
+    }
+    ctx.stroke();
+  }
+
+  // splats: pontos coloridos onde o fóton bateu. Blend aditivo ('lighter')
+  // acumula brilho. ltGaussian troca fillRect 3×3 por uma textura gaussian 9×9
+  // cacheada por cor — visual mais suave/etéreo, custo similar via drawImage.
+  if (ltSplats) {
+    ctx.globalCompositeOperation = 'lighter';
+    const splatBaseAlpha = 0.30;
+    for (let pi = 0; pi < photonCount; pi++) {
+      const len = photonLen[pi];
+      const slotBase = pi * MAX_POINTS;
+      for (let i = 1; i < len; i++) {
+        const idx = slotBase + i;
+        if (!projValid[idx]) continue;
+        // splat brilho representa o que arrived aqui → intensity[i-1]
+        const energyMul = useIntensity ? photonIntensity[slotBase + i - 1] : 1;
+        const a = splatBaseAlpha * projFog[idx] * energyMul;
+        const cidx = idx * 3;
+        const r = (photonRGB[cidx]   * 255) | 0;
+        const g = (photonRGB[cidx+1] * 255) | 0;
+        const b = (photonRGB[cidx+2] * 255) | 0;
+        const px = projX[idx] | 0;
+        const py = projY[idx] | 0;
+        if (ltGaussian) {
+          ctx.globalAlpha = a;
+          ctx.drawImage(gaussianSplatCanvas(r, g, b), px - 4, py - 4);
+        } else {
+          ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
+          ctx.fillRect(px - 1, py - 1, 3, 3);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
   }
 }
 
@@ -355,106 +652,180 @@ function drawShaded(view) {
 }
 
 // ---------- estado / interação ----------
-import { startPathTracer, stopPathTracer, lightSphere, tracePhotonPath } from './raytrace.js';
+import {
+  tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId,
+} from './raytrace.js';
 
-let mode = 'wireframe';      // wireframe | shaded | pathtrace
-let prevMode = 'wireframe';  // pra voltar quando sair do PT
-let rx = 0.2, ry = 0.5;
+let mode = 'wireframe';      // wireframe | shaded | lighttrace
+let prevRasterMode = 'wireframe';
+// câmera livre: posição em world space + euler angles
+let camPos = [-6, 1.7, 0];   // dentro da sala A, olhando pra leste
+let yaw = -Math.PI / 2, pitch = 0;
+let lastFrameTime = 0;
+const keys = Object.create(null);
 let dragging = false, lastX = 0, lastY = 0;
-const samplesInfo = document.getElementById('samples-info');
-const samplesEl   = document.getElementById('samples');
+const roomLabel = document.getElementById('room-label');
 
 canvas.addEventListener('mousedown', e => {
-  if (mode === 'pathtrace') return;
   dragging = true; lastX = e.clientX; lastY = e.clientY;
 });
 window.addEventListener('mouseup', () => dragging = false);
 window.addEventListener('mousemove', e => {
   if (!dragging) return;
-  ry += (e.clientX - lastX) * 0.01;
-  rx += (e.clientY - lastY) * 0.01;
+  yaw   -= (e.clientX - lastX) * 0.005;
+  pitch -= (e.clientY - lastY) * 0.005;
+  const limit = Math.PI / 2 - 0.05;
+  pitch = Math.max(-limit, Math.min(limit, pitch));
   lastX = e.clientX; lastY = e.clientY;
-  lightTraceDirty = true;
 });
-const RASTER_MODES = ['wireframe', 'shaded', 'lighttrace'];
+
+// teclas de movimento (estado segurado, aplicado em frame() com dt)
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  // bloqueia scroll do espaço
+  if (e.code === 'Space') e.preventDefault();
+}, { passive: false });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function applyMovement(dt) {
+  let moved = false;
+  const fast = keys.ShiftLeft || keys.ShiftRight;
+  const speed = (fast ? 12 : 4) * dt;
+  if (speed === 0) return false;
+  // forward/right horizontais (ignoram pitch)
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const fx = -sy, fz = -cy;  // forward
+  const rx = cy,  rz = -sy;  // right
+  if (keys.KeyW) { camPos[0] += fx*speed; camPos[2] += fz*speed; moved = true; }
+  if (keys.KeyS) { camPos[0] -= fx*speed; camPos[2] -= fz*speed; moved = true; }
+  if (keys.KeyD) { camPos[0] += rx*speed; camPos[2] += rz*speed; moved = true; }
+  if (keys.KeyA) { camPos[0] -= rx*speed; camPos[2] -= rz*speed; moved = true; }
+  if (keys.KeyE || keys.Space) { camPos[1] += speed; moved = true; }
+  if (keys.KeyQ) { camPos[1] -= speed; moved = true; }
+  return moved;
+}
 window.addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') {
-    if (mode === 'pathtrace') return;
-    const idx = RASTER_MODES.indexOf(mode);
-    mode = RASTER_MODES[(idx + 1) % RASTER_MODES.length];
+    if (mode !== 'wireframe' && mode !== 'shaded') return;
+    mode = mode === 'wireframe' ? 'shaded' : 'wireframe';
     if (modeLabel) modeLabel.textContent = mode;
-    if (mode === 'lighttrace') lightTraceDirty = true;
-  } else if (e.key === 'r' || e.key === 'R') {
-    if (mode === 'pathtrace') exitPathTrace();
-    else enterPathTrace();
+  } else if (e.key === 'l' || e.key === 'L') {
+    if (mode === 'pathtrace') return;
+    if (mode === 'lighttrace') exitLightTrace();
+    else enterLightTrace();
   }
+  // R (path tracer) desabilitado por enquanto — código preservado em raytrace.js
 });
 
-// ---------- camera extraída da view do raster ----------
-// view = T(-7) * Rx(rx) * Ry(ry)  →  view⁻¹ = Ry(-ry) * Rx(-rx) * T(+7)
-// Aplicado em (0,0,0,1) dá camPos no mundo; em (0,0,-1,0) dá fwd; etc.
-function buildCamera() {
-  const inv = matMul(rotY(-ry), rotX(-rx));
-  const pos   = matVec(inv, [0, 0, 7, 1]).slice(0, 3);
-  const fwd   = matVec(inv, [0, 0, -1, 0]).slice(0, 3);
-  const right = matVec(inv, [1, 0, 0, 0]).slice(0, 3);
-  const up    = matVec(inv, [0, 1, 0, 0]).slice(0, 3);
-  return { pos, fwd, right, up, fov };
+// ---------- transição lighttrace ----------
+const ltPanel = document.getElementById('lt-panel');
+
+function syncLightTracePanel() {
+  if (!ltPanel) return;
+  ltPanel.classList.toggle('open', mode === 'lighttrace');
 }
 
-// ---------- transição raster ↔ pathtrace ----------
-function enterPathTrace() {
-  prevMode = mode;
-  mode = 'pathtrace';
-  inPathTrace = true;
-  cancelAnimationFrame(rafId);
+function enterLightTrace() {
+  prevRasterMode = (mode === 'wireframe' || mode === 'shaded') ? mode : 'wireframe';
+  mode = 'lighttrace';
+  if (modeLabel) modeLabel.textContent = mode;
+  syncLightTracePanel();
+}
 
-  // resolução interna baixa pro PT rodar em CPU; CSS faz upscale
-  const targetW = 480;
-  const ar = window.innerWidth / window.innerHeight;
-  canvas.width = targetW;
-  canvas.height = Math.max(1, Math.round(targetW / ar));
-  canvas.style.imageRendering = 'pixelated';
-  imageData = null;
+function exitLightTrace() {
+  mode = prevRasterMode;
+  if (modeLabel) modeLabel.textContent = mode;
+  syncLightTracePanel();
+}
 
-  if (modeLabel) modeLabel.textContent = 'path tracer';
-  if (samplesInfo) samplesInfo.style.display = '';
-
-  startPathTracer({
-    canvas,
-    ctx,
-    sampleEl: samplesEl,
-    camera: buildCamera(),
+// ---------- bind dos sliders ----------
+function bindSlider(id, valId, onChange) {
+  const input = document.getElementById(id);
+  const valEl = document.getElementById(valId);
+  if (!input) return;
+  input.addEventListener('input', () => {
+    onChange(parseFloat(input.value));
+    if (valEl) valEl.textContent = input.value;
   });
 }
+bindSlider('lt-n',       'lt-n-val',       v => ltPathsPerFrame = v|0);
+bindSlider('lt-alpha',   'lt-alpha-val',   v => ltAlphaBase     = v);
+bindSlider('lt-decay',   'lt-decay-val',   v => ltAlphaDecay    = v);
+bindSlider('lt-bounces', 'lt-bounces-val', v => ltMaxBounces    = v|0);
 
-function exitPathTrace() {
-  stopPathTracer();
-  mode = prevMode;
-  inPathTrace = false;
-  canvas.style.imageRendering = '';
-  if (samplesInfo) samplesInfo.style.display = 'none';
-  if (modeLabel) modeLabel.textContent = mode;
-  resize();
-  if (mode === 'lighttrace') lightTraceDirty = true;
-  frame();
+function bindCheckbox(id, onChange) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('change', () => onChange(el.checked));
+}
+bindCheckbox('lt-splats',      v => ltSplats        = v);
+bindCheckbox('lt-fog',         v => ltFog           = v);
+bindCheckbox('lt-gaussian',    v => ltGaussian      = v);
+bindCheckbox('lt-colorbounce', v => ltColorByBounce = v);
+bindCheckbox('lt-linefirst',   v => ltLineFirstOnly = v);
+bindCheckbox('lt-physdecay',   v => ltPhysicalDecay = v);
+bindCheckbox('lt-wireframe',   v => ltShowWireframe = v);
+bindSlider('lt-contours', 'lt-contours-val', v => ltContoursIntensity = v);
+bindSlider('lt-emission', 'lt-emission-val', v => ltEmissionVar = v);
+
+const ltResetBtn = document.getElementById('lt-reset');
+if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
+  photonHead = 0;
+  photonCount = 0;
+});
+
+const ltBufferEl = document.getElementById('lt-buffer-val');
+
+// ---------- FPS counter (EMA + throttle de DOM) ----------
+const fpsEl = document.getElementById('fps');
+let fpsEMA = 60, fpsLastTime = 0, fpsLastDom = 0;
+function tickFPS() {
+  const now = performance.now();
+  if (fpsLastTime > 0) {
+    const dt = now - fpsLastTime;
+    if (dt > 0) fpsEMA = fpsEMA * 0.9 + (1000 / dt) * 0.1;
+  }
+  fpsLastTime = now;
+  if (fpsEl && now - fpsLastDom > 250) {
+    fpsEl.textContent = fpsEMA.toFixed(0);
+    fpsLastDom = now;
+  }
 }
 
 // ---------- loop ----------
+// rAF principal continua rodando mesmo em PT pra processar WASD/mouse e
+// avisar o PT pra resetar samples quando câmera muda. PT roda seu próprio rAF
+// independente pra renderizar com budget; ambos coexistem.
 let rafId = 0;
+let lastRoomId = null;
 function frame() {
-  if (mode === 'pathtrace') return;  // PT roda seu próprio loop
-  const view = matMul(translate(0, 0, -7), matMul(rotX(rx), rotY(ry)));
+  const now = performance.now();
+  const dt = lastFrameTime > 0 ? Math.min(0.1, (now - lastFrameTime) / 1000) : 0;
+  lastFrameTime = now;
+
+  applyMovement(dt);
+  const newRoomId = setActiveRoomByPos(camPos);
+  if (newRoomId !== lastRoomId) {
+    // mudou de cômodo: zera buffer de fótons (novo cômodo, nova luz)
+    photonHead = 0;
+    photonCount = 0;
+    lastRoomId = newRoomId;
+    if (roomLabel) roomLabel.textContent = newRoomId;
+  }
+
+  tickFPS();
+  const view = matMul(
+    matMul(rotX(-pitch), rotY(-yaw)),
+    translate(-camPos[0], -camPos[1], -camPos[2])
+  );
   if (mode === 'wireframe')       drawWireframe(view);
   else if (mode === 'shaded')     drawShaded(view);
   else if (mode === 'lighttrace') drawLightTrace(view);
+
   rafId = requestAnimationFrame(frame);
 }
 frame();
 
 if (import.meta.hot) {
-  import.meta.hot.dispose(() => {
-    cancelAnimationFrame(rafId);
-    stopPathTracer();
-  });
+  import.meta.hot.dispose(() => cancelAnimationFrame(rafId));
 }

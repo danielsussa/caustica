@@ -10,13 +10,110 @@
     position: fixed; left: 12px; bottom: 12px;
     font-size: 12px; opacity: 0.6; pointer-events: none;
   }
-  .hud a { pointer-events: auto; }
+  .hud a, .hud button { pointer-events: auto; }
+  #lt-panel {
+    position: fixed; top: 12px; right: 12px;
+    background: rgba(0,0,0,0.75);
+    border: 1px solid #333;
+    padding: 12px;
+    border-radius: 6px;
+    font-family: monospace; font-size: 11px;
+    color: #ddd;
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 200px;
+  }
+  #lt-panel.open { display: flex; }
+  #lt-panel h4 { margin: 0 0 4px 0; font-size: 11px; opacity: 0.7; font-weight: normal; }
+  #lt-panel label { display: flex; justify-content: space-between; gap: 8px; }
+  #lt-panel label span { color: #fc8; }
+  #lt-panel input[type=range] { width: 100%; margin: 2px 0; }
+  #lt-panel button {
+    background: #222; color: #ddd; border: 1px solid #555;
+    padding: 4px 8px; cursor: pointer; font-family: inherit; font-size: 11px;
+    border-radius: 3px;
+  }
+  #lt-panel button:hover { background: #333; }
 </style>
 </head>
 <body>
   <canvas id="screen"></canvas>
   <div class="hud">
-    modo: <span id="mode-label">wireframe</span> · <b>M</b> wireframe/shaded/lighttrace · <b>R</b> path tracer · arraste pra rotacionar<span id="samples-info" style="display:none"> · samples: <b id="samples">0</b></span>
+    modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wireframe/shaded · <b>L</b> lighttrace · <b>WASD</b> andar · <b>Q/E</b> baixo/cima · <b>shift</b> rápido · drag pra olhar · fps: <b id="fps">--</b>
+  </div>
+  <div id="lt-panel">
+    <h4>lighttrace params</h4>
+    <div>
+      <label>paths/frame <span id="lt-n-val">40</span></label>
+      <input type="range" id="lt-n" min="5" max="200" step="5" value="40">
+    </div>
+    <div>
+      <label>brilho <span id="lt-alpha-val">0.05</span></label>
+      <input type="range" id="lt-alpha" min="0.005" max="0.2" step="0.005" value="0.05">
+    </div>
+    <div>
+      <label>decay/bounce <span id="lt-decay-val">0.45</span></label>
+      <input type="range" id="lt-decay" min="0.1" max="0.95" step="0.05" value="0.45">
+    </div>
+    <div>
+      <label>max bounces <span id="lt-bounces-val">4</span></label>
+      <input type="range" id="lt-bounces" min="1" max="4" step="1" value="4">
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>splats coloridos</span>
+        <input type="checkbox" id="lt-splats" checked>
+      </label>
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>halo gaussian</span>
+        <input type="checkbox" id="lt-gaussian">
+      </label>
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>depth fog</span>
+        <input type="checkbox" id="lt-fog" checked>
+      </label>
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>cor por bounce</span>
+        <input type="checkbox" id="lt-colorbounce">
+      </label>
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>linhas só nos 1ºs bounces</span>
+        <input type="checkbox" id="lt-linefirst">
+      </label>
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>decay físico</span>
+        <input type="checkbox" id="lt-physdecay">
+      </label>
+    </div>
+    <div>
+      <label>variação emissão <span id="lt-emission-val">0</span></label>
+      <input type="range" id="lt-emission" min="0" max="1" step="0.05" value="0">
+    </div>
+    <div>
+      <label>contornos <span id="lt-contours-val">0</span></label>
+      <input type="range" id="lt-contours" min="0" max="1" step="0.05" value="0">
+    </div>
+    <div>
+      <label style="cursor:pointer">
+        <span>mostrar wireframe</span>
+        <input type="checkbox" id="lt-wireframe">
+      </label>
+    </div>
+    <div>
+      <label>buffer <span id="lt-buffer-val">0 / 8000</span></label>
+    </div>
+    <button id="lt-reset">limpar buffer</button>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>
