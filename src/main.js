@@ -3,6 +3,7 @@ const ctx = canvas.getContext('2d');
 const modeLabel = document.getElementById('mode-label');
 let W = 0, H = 0, aspect = 1;
 let inPathTrace = false;
+let lightTraceDirty = true;
 
 function resize() {
   if (inPathTrace) return; // PT controla seu próprio canvas
@@ -12,6 +13,7 @@ function resize() {
   canvas.height = H;
   aspect = W / H;
   imageData = null; // força recriar buffer
+  lightTraceDirty = true;
 }
 let imageData = null, u32 = null, zbuf = null;
 function ensureBuffers() {
@@ -258,6 +260,59 @@ function drawWireframe(view) {
   }
 }
 
+// canvas em lighttrace acumula. lightTraceDirty é setado quando precisamos
+// limpar e redesenhar o wireframe (entrada no modo, rotação, resize).
+function drawLightTrace(view) {
+  if (lightTraceDirty) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineWidth = 1;
+    for (const obj of scene) {
+      const projected = obj.verts.map(p => {
+        const v = matVec(view, [p[0], p[1], p[2], 1]);
+        return project(v);
+      });
+      const [r, g, b] = obj.rgb;
+      ctx.strokeStyle = obj.emissive
+        ? `rgba(${r},${g},${b},0.85)`
+        : `rgba(${r},${g},${b},0.18)`;
+      ctx.beginPath();
+      for (const [a, b2] of obj.edges) {
+        const pa = projected[a], pb = projected[b2];
+        if (!pa || !pb) continue;
+        ctx.moveTo(pa[0], pa[1]);
+        ctx.lineTo(pb[0], pb[1]);
+      }
+      ctx.stroke();
+    }
+    lightTraceDirty = false;
+  }
+
+  // a cada frame sorteia N caminhos com alpha bem baixo —
+  // canvas vai acumulando, áreas com mais fluxo de luz ficam mais brilhantes
+  const N_TRACES = 40;
+  const MAX_BOUNCES = 4;
+  ctx.lineWidth = 1;
+  for (let i = 0; i < N_TRACES; i++) {
+    const path = tracePhotonPath(MAX_BOUNCES);
+    if (path.length < 2) continue;
+    const proj = path.map(p => {
+      const v = matVec(view, [p[0], p[1], p[2], 1]);
+      return project(v);
+    });
+    for (let s = 0; s < proj.length - 1; s++) {
+      const pa = proj[s], pb = proj[s+1];
+      if (!pa || !pb) continue;
+      const alpha = Math.pow(0.45, s) * 0.05;
+      ctx.strokeStyle = `rgba(255, 220, 140, ${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(pa[0], pa[1]);
+      ctx.lineTo(pb[0], pb[1]);
+      ctx.stroke();
+    }
+  }
+}
+
 function drawShaded(view) {
   ensureBuffers();
   u32.fill(0xff111111);    // background um pouco acima do preto
@@ -300,7 +355,7 @@ function drawShaded(view) {
 }
 
 // ---------- estado / interação ----------
-import { startPathTracer, stopPathTracer, lightSphere } from './raytrace.js';
+import { startPathTracer, stopPathTracer, lightSphere, tracePhotonPath } from './raytrace.js';
 
 let mode = 'wireframe';      // wireframe | shaded | pathtrace
 let prevMode = 'wireframe';  // pra voltar quando sair do PT
@@ -319,12 +374,16 @@ window.addEventListener('mousemove', e => {
   ry += (e.clientX - lastX) * 0.01;
   rx += (e.clientY - lastY) * 0.01;
   lastX = e.clientX; lastY = e.clientY;
+  lightTraceDirty = true;
 });
+const RASTER_MODES = ['wireframe', 'shaded', 'lighttrace'];
 window.addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') {
     if (mode === 'pathtrace') return;
-    mode = mode === 'wireframe' ? 'shaded' : 'wireframe';
+    const idx = RASTER_MODES.indexOf(mode);
+    mode = RASTER_MODES[(idx + 1) % RASTER_MODES.length];
     if (modeLabel) modeLabel.textContent = mode;
+    if (mode === 'lighttrace') lightTraceDirty = true;
   } else if (e.key === 'r' || e.key === 'R') {
     if (mode === 'pathtrace') exitPathTrace();
     else enterPathTrace();
@@ -377,6 +436,7 @@ function exitPathTrace() {
   if (samplesInfo) samplesInfo.style.display = 'none';
   if (modeLabel) modeLabel.textContent = mode;
   resize();
+  if (mode === 'lighttrace') lightTraceDirty = true;
   frame();
 }
 
@@ -385,8 +445,9 @@ let rafId = 0;
 function frame() {
   if (mode === 'pathtrace') return;  // PT roda seu próprio loop
   const view = matMul(translate(0, 0, -7), matMul(rotX(rx), rotY(ry)));
-  if (mode === 'wireframe') drawWireframe(view);
-  else drawShaded(view);
+  if (mode === 'wireframe')       drawWireframe(view);
+  else if (mode === 'shaded')     drawShaded(view);
+  else if (mode === 'lighttrace') drawLightTrace(view);
   rafId = requestAnimationFrame(frame);
 }
 frame();

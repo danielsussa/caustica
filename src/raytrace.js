@@ -300,3 +300,39 @@ export function stopPathTracer() {
   if (rafId) cancelAnimationFrame(rafId);
   rafId = 0;
 }
+
+// ---------- traçar caminho de fóton (visualização) ----------
+// Sai de um ponto aleatório na superfície da esfera de luz, com direção
+// cosine-weighted do hemisfério externo, e bounce difusa nas superfícies.
+// Retorna polilinha em world space: [pontoNaLuz, hit1, hit2, ...].
+export function tracePhotonPath(maxBounces = 4) {
+  const points = [];
+  const u1 = Math.random();
+  const u2 = Math.random();
+  const z = 1 - 2 * u1;
+  const rr = Math.sqrt(Math.max(0, 1 - z*z));
+  const phi = 2 * Math.PI * u2;
+  const ln = [rr * Math.cos(phi), z, rr * Math.sin(phi)];
+  let pos = [
+    lightSphere.c[0] + lightSphere.r * ln[0],
+    lightSphere.c[1] + lightSphere.r * ln[1],
+    lightSphere.c[2] + lightSphere.r * ln[2],
+  ];
+  let dir = sampleCosineHemisphere(ln);
+  points.push(pos);
+
+  for (let b = 0; b < maxBounces; b++) {
+    const { t, mat, n: rawN } = intersectScene(pos, dir);
+    if (!mat) break;
+    const hp = [pos[0] + t*dir[0], pos[1] + t*dir[1], pos[2] + t*dir[2]];
+    points.push(hp);
+    if (mat.kind === M_LIGHT) break;
+
+    let n = rawN;
+    if (dot(n, dir) > 0) n = [-n[0], -n[1], -n[2]];
+    const eps = 1e-4;
+    pos = [hp[0] + n[0]*eps, hp[1] + n[1]*eps, hp[2] + n[2]*eps];
+    dir = sampleCosineHemisphere(n);
+  }
+  return points;
+}
