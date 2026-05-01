@@ -178,7 +178,159 @@ const roomC = buildRoom('C', [2, 0, -4], [10, 5, 4],
 
 export const rooms = [roomA, roomB, roomC];
 
-// ---------- active room ----------
+// arrays planos com tudo de todos os cômodos. Usados nos intersects pra
+// permitir fótons atravessarem portas. Cômodos longe são naturalmente
+// fog-culled durante a projeção.
+const allTris = [];
+const allSphs = [];
+const allLights = [];
+for (const r of rooms) {
+  for (const t of r.tris)   allTris.push(t);
+  for (const s of r.sphs)   allSphs.push(s);
+  for (const l of r.lights) allLights.push(l);
+}
+
+// ---------- BVH (median-split, leaf size 4) ----------
+// Acelera intersect de O(N) pra ~O(log N). Construído uma vez no load.
+// Toggle exposto pra comparar performance brute vs BVH.
+let useBVH = true;
+export function setUseBVH(v) { useBVH = !!v; }
+export function getBVHStats() {
+  return { items: allTris.length + allSphs.length };
+}
+
+// contadores pra verificar BVH vs brute. Reset/get expostos pro main.js
+// chamar uma vez por frame (depois da geração de fótons).
+let countPrim = 0, countAABB = 0;
+export function resetIntersectCounters() { countPrim = 0; countAABB = 0; }
+export function getIntersectCounters() { return { prim: countPrim, aabb: countAABB }; }
+
+function triBounds(t) {
+  return {
+    min: [
+      Math.min(t.v0[0], t.v1[0], t.v2[0]),
+      Math.min(t.v0[1], t.v1[1], t.v2[1]),
+      Math.min(t.v0[2], t.v1[2], t.v2[2]),
+    ],
+    max: [
+      Math.max(t.v0[0], t.v1[0], t.v2[0]),
+      Math.max(t.v0[1], t.v1[1], t.v2[1]),
+      Math.max(t.v0[2], t.v1[2], t.v2[2]),
+    ],
+  };
+}
+function sphBounds(s) {
+  return {
+    min: [s.c[0]-s.r, s.c[1]-s.r, s.c[2]-s.r],
+    max: [s.c[0]+s.r, s.c[1]+s.r, s.c[2]+s.r],
+  };
+}
+
+function buildBVH(items) {
+  function build(items) {
+    if (items.length <= 4) {
+      const minB = [Infinity, Infinity, Infinity];
+      const maxB = [-Infinity, -Infinity, -Infinity];
+      for (const it of items) {
+        for (let k = 0; k < 3; k++) {
+          if (it.bounds.min[k] < minB[k]) minB[k] = it.bounds.min[k];
+          if (it.bounds.max[k] > maxB[k]) maxB[k] = it.bounds.max[k];
+        }
+      }
+      return { leaf: true, items, boundsMin: minB, boundsMax: maxB };
+    }
+    const minB = [Infinity, Infinity, Infinity];
+    const maxB = [-Infinity, -Infinity, -Infinity];
+    for (const it of items) {
+      for (let k = 0; k < 3; k++) {
+        if (it.bounds.min[k] < minB[k]) minB[k] = it.bounds.min[k];
+        if (it.bounds.max[k] > maxB[k]) maxB[k] = it.bounds.max[k];
+      }
+    }
+    const dx = maxB[0]-minB[0], dy = maxB[1]-minB[1], dz = maxB[2]-minB[2];
+    const axis = dx > dy && dx > dz ? 0 : (dy > dz ? 1 : 2);
+    items.sort((a, b) => {
+      const ca = (a.bounds.min[axis] + a.bounds.max[axis]) * 0.5;
+      const cb = (b.bounds.min[axis] + b.bounds.max[axis]) * 0.5;
+      return ca - cb;
+    });
+    const mid = items.length >> 1;
+    return {
+      leaf: false,
+      boundsMin: minB, boundsMax: maxB,
+      left:  build(items.slice(0, mid)),
+      right: build(items.slice(mid)),
+    };
+  }
+  return build([...items]);
+}
+
+const bvhItems = [
+  ...allTris.map(t => ({ kind: 0, data: t, bounds: triBounds(t) })),
+  ...allSphs.map(s => ({ kind: 1, data: s, bounds: sphBounds(s) })),
+];
+const bvhRoot = buildBVH(bvhItems);
+
+// Ray-AABB slab. Retorna true se intersecta E está mais perto que tMaxLimit.
+function intersectAABB(boxMin, boxMax, ro, invDx, invDy, invDz, tMaxLimit) {
+  countAABB++;
+  let t1 = (boxMin[0] - ro[0]) * invDx;
+  let t2 = (boxMax[0] - ro[0]) * invDx;
+  let tmin = Math.min(t1, t2), tmax = Math.max(t1, t2);
+  t1 = (boxMin[1] - ro[1]) * invDy;
+  t2 = (boxMax[1] - ro[1]) * invDy;
+  tmin = Math.max(tmin, Math.min(t1, t2));
+  tmax = Math.min(tmax, Math.max(t1, t2));
+  t1 = (boxMin[2] - ro[2]) * invDz;
+  t2 = (boxMax[2] - ro[2]) * invDz;
+  tmin = Math.max(tmin, Math.min(t1, t2));
+  tmax = Math.min(tmax, Math.max(t1, t2));
+  return tmax >= Math.max(0, tmin) && tmin < tMaxLimit;
+}
+
+// Closest hit: atualiza hit em-place
+function bvhClosest(node, ro, rd, invDx, invDy, invDz, hit) {
+  if (!intersectAABB(node.boundsMin, node.boundsMax, ro, invDx, invDy, invDz, hit.t)) return;
+  if (node.leaf) {
+    for (const it of node.items) {
+      if (it.kind === 0) {
+        const t = intersectTri(it.data, ro, rd);
+        if (t < hit.t) { hit.t = t; hit.mat = it.data.mat; hit.n = it.data.n; }
+      } else {
+        const s = it.data;
+        const t = intersectSphere(s, ro, rd);
+        if (t < hit.t) {
+          hit.t = t;
+          hit.mat = s.mat;
+          const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
+          hit.n = norm([px - s.c[0], py - s.c[1], pz - s.c[2]]);
+        }
+      }
+    }
+    return;
+  }
+  bvhClosest(node.left,  ro, rd, invDx, invDy, invDz, hit);
+  bvhClosest(node.right, ro, rd, invDx, invDy, invDz, hit);
+}
+
+// Any hit (early exit) pra shadow rays
+function bvhAnyHit(node, ro, rd, invDx, invDy, invDz, maxT) {
+  if (!intersectAABB(node.boundsMin, node.boundsMax, ro, invDx, invDy, invDz, maxT)) return false;
+  if (node.leaf) {
+    for (const it of node.items) {
+      const t = it.kind === 0
+        ? intersectTri(it.data, ro, rd)
+        : intersectSphere(it.data, ro, rd);
+      if (t < maxT) return true;
+    }
+    return false;
+  }
+  if (bvhAnyHit(node.left,  ro, rd, invDx, invDy, invDz, maxT)) return true;
+  if (bvhAnyHit(node.right, ro, rd, invDx, invDy, invDz, maxT)) return true;
+  return false;
+}
+
+// ---------- active room (só pra HUD/info, não pra culling) ----------
 let activeRoom = rooms[0];
 
 export function setActiveRoomByPos(pos) {
@@ -198,6 +350,7 @@ export function getActiveRoomId() { return activeRoom.id; }
 
 // ---------- interseção (apenas no cômodo ativo) ----------
 function intersectTri(tri, ro, rd) {
+  countPrim++;
   const v0 = tri.v0;
   const e1x = tri.v1[0]-v0[0], e1y = tri.v1[1]-v0[1], e1z = tri.v1[2]-v0[2];
   const e2x = tri.v2[0]-v0[0], e2y = tri.v2[1]-v0[1], e2z = tri.v2[2]-v0[2];
@@ -220,6 +373,7 @@ function intersectTri(tri, ro, rd) {
 }
 
 function intersectSphere(s, ro, rd) {
+  countPrim++;
   const ocx = ro[0]-s.c[0], ocy = ro[1]-s.c[1], ocz = ro[2]-s.c[2];
   const b = ocx*rd[0] + ocy*rd[1] + ocz*rd[2];
   const c = ocx*ocx + ocy*ocy + ocz*ocz - s.r*s.r;
@@ -232,43 +386,48 @@ function intersectSphere(s, ro, rd) {
 }
 
 function intersectScene(ro, rd) {
-  let tMin = Infinity, mat = null, n = null;
-  const tris = activeRoom.tris;
-  for (let i = 0; i < tris.length; i++) {
-    const t = intersectTri(tris[i], ro, rd);
-    if (t < tMin) { tMin = t; mat = tris[i].mat; n = tris[i].n; }
-  }
-  const sphs = activeRoom.sphs;
-  for (let i = 0; i < sphs.length; i++) {
-    const t = intersectSphere(sphs[i], ro, rd);
-    if (t < tMin) {
-      tMin = t;
-      mat = sphs[i].mat;
-      const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
-      n = norm([px - sphs[i].c[0], py - sphs[i].c[1], pz - sphs[i].c[2]]);
+  const hit = { t: Infinity, mat: null, n: null };
+  if (useBVH) {
+    bvhClosest(bvhRoot, ro, rd, 1/rd[0], 1/rd[1], 1/rd[2], hit);
+  } else {
+    for (let i = 0; i < allTris.length; i++) {
+      const t = intersectTri(allTris[i], ro, rd);
+      if (t < hit.t) { hit.t = t; hit.mat = allTris[i].mat; hit.n = allTris[i].n; }
+    }
+    for (let i = 0; i < allSphs.length; i++) {
+      const s = allSphs[i];
+      const t = intersectSphere(s, ro, rd);
+      if (t < hit.t) {
+        hit.t = t;
+        hit.mat = s.mat;
+        const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
+        hit.n = norm([px - s.c[0], py - s.c[1], pz - s.c[2]]);
+      }
     }
   }
-  for (let i = 0; i < activeRoom.lights.length; i++) {
-    const lt = activeRoom.lights[i];
+  // luzes ficam fora do BVH (só ~3, brute é igual)
+  for (let i = 0; i < allLights.length; i++) {
+    const lt = allLights[i];
     const t = intersectSphere(lt, ro, rd);
-    if (t < tMin) {
-      tMin = t;
-      mat = { kind: M_LIGHT, emission: lt.emission };
+    if (t < hit.t) {
+      hit.t = t;
+      hit.mat = { kind: M_LIGHT, emission: lt.emission };
       const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
-      n = norm([px - lt.c[0], py - lt.c[1], pz - lt.c[2]]);
+      hit.n = norm([px - lt.c[0], py - lt.c[1], pz - lt.c[2]]);
     }
   }
-  return { t: tMin, mat, n };
+  return hit;
 }
 
 function occluded(ro, rd, maxT) {
-  const tris = activeRoom.tris;
-  for (let i = 0; i < tris.length; i++) {
-    if (intersectTri(tris[i], ro, rd) < maxT) return true;
+  if (useBVH) {
+    return bvhAnyHit(bvhRoot, ro, rd, 1/rd[0], 1/rd[1], 1/rd[2], maxT);
   }
-  const sphs = activeRoom.sphs;
-  for (let i = 0; i < sphs.length; i++) {
-    if (intersectSphere(sphs[i], ro, rd) < maxT) return true;
+  for (let i = 0; i < allTris.length; i++) {
+    if (intersectTri(allTris[i], ro, rd) < maxT) return true;
+  }
+  for (let i = 0; i < allSphs.length; i++) {
+    if (intersectSphere(allSphs[i], ro, rd) < maxT) return true;
   }
   return false;
 }
@@ -293,9 +452,11 @@ function sampleCosineHemisphere(n) {
   ];
 }
 
-// ---------- direct lighting (NEE), usa primeira luz do cômodo ativo ----------
+// ---------- direct lighting (NEE) ----------
+// Sample uniforme entre todas as luzes do mundo (1/N pdf, compensa
+// multiplicando contribuição por N).
 function directLight(p, n, albedo) {
-  const lt = activeRoom.lights[0];
+  const lt = allLights[(Math.random() * allLights.length) | 0];
   const lightArea = 4 * Math.PI * lt.r * lt.r;
   const u1 = Math.random();
   const u2 = Math.random();
@@ -315,7 +476,8 @@ function directLight(p, n, albedo) {
   const cosLight = -(lnx*wx + lny*wy + lnz*wz);
   if (cosLight <= 0) return [0,0,0];
   if (occluded(p, [wx,wy,wz], dist - 1e-3)) return [0,0,0];
-  const factor = (lightArea * cosSurf * cosLight) / (Math.PI * distSq);
+  // factor inclui N (allLights.length) pra compensar pdf 1/N de seleção uniforme
+  const factor = (lightArea * cosSurf * cosLight * allLights.length) / (Math.PI * distSq);
   return [
     albedo[0] * lt.emission[0] * factor,
     albedo[1] * lt.emission[1] * factor,
@@ -433,7 +595,9 @@ export function tracePhotonPath(maxBounces = 4, emissionVar = 0, applyDecay = fa
   const points = [];
   const colors = [];
   const intensities = [];
-  const lt = activeRoom.lights[0];
+  // sorteia uma luz uniformemente entre todas. Isso dispersa fótons de
+  // todos os cômodos pelo buffer; cômodos longe são naturalmente fog-culled.
+  const lt = allLights[(Math.random() * allLights.length) | 0];
   const me = Math.max(lt.emission[0], lt.emission[1], lt.emission[2]);
   const lightColor = [lt.emission[0]/me, lt.emission[1]/me, lt.emission[2]/me];
 

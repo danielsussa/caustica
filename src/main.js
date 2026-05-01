@@ -316,6 +316,9 @@ let ltEmissionVar   = 0;     // 0 = todos fótons saem com energia 1; 1 = unifor
 const FOG_STRENGTH        = 0.06;
 const N_FOG_BUCKETS       = 4;
 const N_INTENSITY_BUCKETS = 8;
+// fog culling: pontos com w * FOG_STRENGTH > este limite têm fog < exp(-LIM)
+// e são puramente invisíveis. Pula projection X/Y + draw. Só ativa com fog on.
+const FOG_CULL_LIMIT      = 5;  // exp(-5) ≈ 0.007
 
 function appendPhotonPath(pts, cols, intensities) {
   const slot = photonHead;
@@ -428,11 +431,10 @@ function drawLightTrace(view) {
   ctx.fillRect(0, 0, W, H);
 
   // wireframe (incluindo a esfera de luz) só quando ltShowWireframe.
-  const activeId = getActiveRoomId();
+  // Mostra TODOS os cômodos — fog culling esconde os longe naturalmente.
   ctx.lineWidth = 1;
   if (ltShowWireframe) {
     for (const obj of scene) {
-      if (obj.roomId !== activeId) continue;
       const projected = obj.verts.map(p => {
         const v = matVec(view, [p[0], p[1], p[2], 1]);
         return project(v);
@@ -454,7 +456,6 @@ function drawLightTrace(view) {
   if (ltContoursIntensity > 0) {
     ctx.lineWidth = 1.2;
     for (const obj of scene) {
-      if (obj.roomId !== activeId) continue;
       const [r, g, b] = obj.rgb;
       const a = (obj.emissive ? 0.85 : 0.5) * ltContoursIntensity;
       ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
@@ -482,9 +483,14 @@ function drawLightTrace(view) {
   }
 
   // adiciona N caminhos novos no ring buffer
+  resetIntersectCounters();
   for (let i = 0; i < ltPathsPerFrame; i++) {
     const p = tracePhotonPath(ltMaxBounces, ltEmissionVar, ltPhysicalDecay);
     if (p.points.length >= 2) appendPhotonPath(p.points, p.colors, p.intensities);
+  }
+  if (intersectStatsEl) {
+    const c = getIntersectCounters();
+    intersectStatsEl.textContent = `prim ${c.prim} · aabb ${c.aabb}`;
   }
   const useIntensity = ltPhysicalDecay || ltEmissionVar > 0;
   if (ltBufferEl) ltBufferEl.textContent = `${photonCount} / ${MAX_PATHS}`;
@@ -505,19 +511,22 @@ function drawLightTrace(view) {
       const wx = photonXYZ[off++];
       const wy = photonXYZ[off++];
       const wz = photonXYZ[off++];
-      const cx = m00*wx + m01*wy + m02*wz + m03;
-      const cy = m10*wx + m11*wy + m12*wz + m13;
+      // calcula só cz primeiro pra culling barato
       const cz = m20*wx + m21*wy + m22*wz + m23;
       const w = -cz;
       const idx = slotBase + i;
-      if (w <= 0) {
+      if (w <= 0) { projValid[idx] = 0; continue; }
+      // fog culling: ponto invisível pelo fog → pula projeção e draw
+      if (ltFog && w * FOG_STRENGTH > FOG_CULL_LIMIT) {
         projValid[idx] = 0;
-      } else {
-        projX[idx] = (fxa * cx / w + 1) * halfW;
-        projY[idx] = (1 - f * cy / w) * halfH;
-        projFog[idx] = ltFog ? Math.exp(-w * FOG_STRENGTH) : 1;
-        projValid[idx] = 1;
+        continue;
       }
+      const cx = m00*wx + m01*wy + m02*wz + m03;
+      const cy = m10*wx + m11*wy + m12*wz + m13;
+      projX[idx] = (fxa * cx / w + 1) * halfW;
+      projY[idx] = (1 - f * cy / w) * halfH;
+      projFog[idx] = ltFog ? Math.exp(-w * FOG_STRENGTH) : 1;
+      projValid[idx] = 1;
     }
   }
 
@@ -653,7 +662,8 @@ function drawShaded(view) {
 
 // ---------- estado / interação ----------
 import {
-  tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId,
+  tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
+  resetIntersectCounters, getIntersectCounters,
 } from './raytrace.js';
 
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
@@ -764,6 +774,7 @@ bindCheckbox('lt-gaussian',    v => ltGaussian      = v);
 bindCheckbox('lt-colorbounce', v => ltColorByBounce = v);
 bindCheckbox('lt-linefirst',   v => ltLineFirstOnly = v);
 bindCheckbox('lt-physdecay',   v => ltPhysicalDecay = v);
+bindCheckbox('lt-bvh',         v => setUseBVH(v));
 bindCheckbox('lt-wireframe',   v => ltShowWireframe = v);
 bindSlider('lt-contours', 'lt-contours-val', v => ltContoursIntensity = v);
 bindSlider('lt-emission', 'lt-emission-val', v => ltEmissionVar = v);
@@ -775,6 +786,7 @@ if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
 });
 
 const ltBufferEl = document.getElementById('lt-buffer-val');
+const intersectStatsEl = document.getElementById('lt-intersect-stats');
 
 // ---------- FPS counter (EMA + throttle de DOM) ----------
 const fpsEl = document.getElementById('fps');
@@ -806,9 +818,8 @@ function frame() {
   applyMovement(dt);
   const newRoomId = setActiveRoomByPos(camPos);
   if (newRoomId !== lastRoomId) {
-    // mudou de cômodo: zera buffer de fótons (novo cômodo, nova luz)
-    photonHead = 0;
-    photonCount = 0;
+    // mudou de cômodo: só atualiza HUD. Buffer persiste — fótons de todas
+    // luzes acumulam, fog culling esconde os distantes.
     lastRoomId = newRoomId;
     if (roomLabel) roomLabel.textContent = newRoomId;
   }
