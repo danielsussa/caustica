@@ -41,7 +41,9 @@
   }
   #btn-up   { bottom: 100px; }
   #btn-down { bottom: 24px; }
+  #btn-l    { bottom: 176px; }
   .vbtn.pressed { background: rgba(255,255,255,0.20); }
+  .vbtn.active  { background: rgba(255,200,120,0.35); border-color: rgba(255,200,120,0.6); }
   /* esconde controles touch em desktops com mouse — escolha de UI: deixar
      sempre visíveis pra ser óbvio que existem. Pode trocar pra @media. */
   .hud {
@@ -81,6 +83,7 @@
   <div id="joystick"><div id="joystick-thumb"></div></div>
   <div class="vbtn" id="btn-up">↑</div>
   <div class="vbtn" id="btn-down">↓</div>
+  <div class="vbtn" id="btn-l">L</div>
   <div class="hud">
     modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wireframe/shaded · <b>L</b> lighttrace · <b>R</b> path tracer · <b>WASD</b> · <b>Q/E</b> ou ↑↓ · drag/touch pra olhar · fps: <b id="fps">--</b><span id="samples-info" style="display:none"> · samples: <b id="samples">0</b></span>
   </div>

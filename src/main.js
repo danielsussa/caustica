@@ -995,12 +995,26 @@ function enterLightTrace() {
   mode = 'lighttrace';
   if (modeLabel) modeLabel.textContent = mode;
   syncLightTracePanel();
+  btnLEl?.classList.add('active');
 }
 
 function exitLightTrace() {
   mode = prevRasterMode;
   if (modeLabel) modeLabel.textContent = mode;
   syncLightTracePanel();
+  btnLEl?.classList.remove('active');
+}
+
+const btnLEl = document.getElementById('btn-l');
+function toggleLightTrace() {
+  if (mode === 'pathtrace') return;
+  if (mode === 'lighttrace') exitLightTrace();
+  else enterLightTrace();
+}
+if (btnLEl) {
+  btnLEl.addEventListener('click', toggleLightTrace);
+  // touchstart com preventDefault evita o duplo-fire (touch + click sintético)
+  btnLEl.addEventListener('touchstart', e => { e.preventDefault(); toggleLightTrace(); }, { passive: false });
 }
 
 // ---------- bind dos sliders ----------
