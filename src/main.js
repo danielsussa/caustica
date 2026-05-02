@@ -188,10 +188,16 @@ for (const room of rooms) {
     });
   }
   for (const l of room.visual.lights) {
-    scene.push({
-      ...sphereGeom(l.c, l.r, 10, 14), rgb: l.rgb, emissive: true, roomId: rid,
-      kind: 'sphere', sphCenter: l.c, sphRadius: l.r,
-    });
+    if (l.kind === 'quad') {
+      scene.push({
+        ...quadEntry(l), rgb: l.rgb, emissive: true, roomId: rid, kind: 'quad',
+      });
+    } else {
+      scene.push({
+        ...sphereGeom(l.c, l.r, 10, 14), rgb: l.rgb, emissive: true, roomId: rid,
+        kind: 'sphere', sphCenter: l.c, sphRadius: l.r,
+      });
+    }
   }
 }
 
@@ -347,6 +353,64 @@ const projValid = new Uint8Array(MAX_PATHS * MAX_POINTS);
 // nunca encolher. Em prática ~80 entries.
 const segmentBuckets = new Map();
 
+// ---------- splat layer (acumula enquanto câmera não mexe) ----------
+// Splats vão num canvas separado que persiste. Cada frame só os splats das
+// paths novas são desenhados; quando a view muda, faz redraw completo do
+// buffer atual (splats velhos do buffer wrap são perdidos). Composite
+// aditivo no main canvas.
+const splatLayer = document.createElement('canvas');
+let splatLayerCtx = null;
+let splatLayerW = 0, splatLayerH = 0;
+let splatLastViewKey = null;
+let splatHeadAtLastDraw = 0;
+let splatLastEnabled = false;
+
+function ensureSplatLayer() {
+  if (splatLayerW !== W || splatLayerH !== H) {
+    splatLayer.width = W;
+    splatLayer.height = H;
+    splatLayerCtx = splatLayer.getContext('2d');
+    splatLayerW = W; splatLayerH = H;
+    splatLastViewKey = null;
+    splatHeadAtLastDraw = 0;
+  }
+}
+
+function getSplatViewKey() {
+  return `${camPos[0].toFixed(2)}|${camPos[1].toFixed(2)}|${camPos[2].toFixed(2)}|${yaw.toFixed(3)}|${pitch.toFixed(3)}|${W}|${H}`;
+}
+
+function drawSplatsToLayer(startSlot, count, useIntensity) {
+  splatLayerCtx.globalCompositeOperation = 'lighter';
+  const splatBaseAlpha = 0.12;
+  for (let i = 0; i < count; i++) {
+    const slot = (startSlot + i) % MAX_PATHS;
+    const slotBase = slot * MAX_POINTS;
+    const len = photonLen[slot];
+    for (let pi = 1; pi < len; pi++) {
+      const idx = slotBase + pi;
+      if (!projValid[idx]) continue;
+      const energyMul = useIntensity ? photonIntensity[slotBase + pi - 1] : 1;
+      const a = splatBaseAlpha * projFog[idx] * energyMul;
+      const cidx = idx * 3;
+      const r = (photonRGB[cidx]   * 255) | 0;
+      const g = (photonRGB[cidx+1] * 255) | 0;
+      const b = (photonRGB[cidx+2] * 255) | 0;
+      const px = projX[idx] | 0;
+      const py = projY[idx] | 0;
+      if (ltGaussian) {
+        splatLayerCtx.globalAlpha = a;
+        splatLayerCtx.drawImage(gaussianSplatCanvas(r, g, b), px - 4, py - 4);
+      } else {
+        splatLayerCtx.fillStyle = `rgba(${r},${g},${b},${a})`;
+        splatLayerCtx.fillRect(px - 1, py - 1, 3, 3);
+      }
+    }
+  }
+  splatLayerCtx.globalAlpha = 1;
+  splatLayerCtx.globalCompositeOperation = 'source-over';
+}
+
 // silhouette de box: arestas entre face front-facing e back-facing.
 // edgeFaces: cada entry [v0, v1, fa, fb] onde v0/v1 são índices de vértice
 // (boxGeom convention) e fa/fb são índices de face: 0=-x, 1=+x, 2=-y, 3=+y, 4=-z, 5=+z
@@ -393,6 +457,21 @@ function drawSphereContour(view, center, radius) {
   ctx.beginPath();
   ctx.arc(sx, sy, screenR, 0, 2 * Math.PI);
   ctx.stroke();
+}
+
+// overlay de objetos animados — desenhados separados a cada frame com
+// posições atualizadas. Aparecem em todos os modos pra dar feedback visual.
+function drawDynamicOverlay(view) {
+  const visuals = getDynamicVisuals();
+  ctx.lineWidth = 1.5;
+  for (const v of visuals) {
+    const [r, g, b] = v.rgb;
+    ctx.strokeStyle = v.kind === 'light'
+      ? `rgba(${r},${g},${b},0.95)`
+      : `rgba(${r},${g},${b},0.7)`;
+    drawSphereContour(view, v.c, v.r);
+  }
+  ctx.lineWidth = 1;
 }
 
 // cache de splat gaussiano por cor RGB. Calculado preguiçosamente.
@@ -584,38 +663,34 @@ function drawLightTrace(view) {
     ctx.stroke();
   }
 
-  // splats: pontos coloridos onde o fóton bateu. Blend aditivo ('lighter')
-  // acumula brilho. ltGaussian troca fillRect 3×3 por uma textura gaussian 9×9
-  // cacheada por cor — visual mais suave/etéreo, custo similar via drawImage.
+  // splats: layer persistente que acumula até a câmera mover. Em vez de
+  // re-desenhar todos os splats no main canvas a cada frame, mantemos eles
+  // num canvas off-screen e só adicionamos os novos. Visual: tipo path
+  // tracer convergindo — pixels onde fótons batem ficam mais brilhantes
+  // ao longo do tempo.
   if (ltSplats) {
-    ctx.globalCompositeOperation = 'lighter';
-    const splatBaseAlpha = 0.30;
-    for (let pi = 0; pi < photonCount; pi++) {
-      const len = photonLen[pi];
-      const slotBase = pi * MAX_POINTS;
-      for (let i = 1; i < len; i++) {
-        const idx = slotBase + i;
-        if (!projValid[idx]) continue;
-        // splat brilho representa o que arrived aqui → intensity[i-1]
-        const energyMul = useIntensity ? photonIntensity[slotBase + i - 1] : 1;
-        const a = splatBaseAlpha * projFog[idx] * energyMul;
-        const cidx = idx * 3;
-        const r = (photonRGB[cidx]   * 255) | 0;
-        const g = (photonRGB[cidx+1] * 255) | 0;
-        const b = (photonRGB[cidx+2] * 255) | 0;
-        const px = projX[idx] | 0;
-        const py = projY[idx] | 0;
-        if (ltGaussian) {
-          ctx.globalAlpha = a;
-          ctx.drawImage(gaussianSplatCanvas(r, g, b), px - 4, py - 4);
-        } else {
-          ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
-          ctx.fillRect(px - 1, py - 1, 3, 3);
-        }
+    ensureSplatLayer();
+    const vk = getSplatViewKey();
+    const justEnabled = !splatLastEnabled;
+    splatLastEnabled = true;
+    if (justEnabled || vk !== splatLastViewKey) {
+      splatLayerCtx.clearRect(0, 0, W, H);
+      drawSplatsToLayer(0, photonCount, useIntensity);
+      splatLastViewKey = vk;
+      splatHeadAtLastDraw = photonHead;
+    } else {
+      const newCount = (photonHead - splatHeadAtLastDraw + MAX_PATHS) % MAX_PATHS;
+      if (newCount > 0) {
+        const startSlot = (photonHead - newCount + MAX_PATHS) % MAX_PATHS;
+        drawSplatsToLayer(startSlot, newCount, useIntensity);
+        splatHeadAtLastDraw = photonHead;
       }
     }
-    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(splatLayer, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
+  } else {
+    splatLastEnabled = false;
   }
 }
 
@@ -664,16 +739,22 @@ function drawShaded(view) {
 import {
   tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
   resetIntersectCounters, getIntersectCounters,
+  tickAnimation, getDynamicVisuals,
 } from './raytrace.js';
 
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
 let prevRasterMode = 'wireframe';
 // câmera livre: posição em world space + euler angles
-let camPos = [-6, 1.7, 0];   // dentro da sala A, olhando pra leste
-let yaw = -Math.PI / 2, pitch = 0;
+let camPos = [0, 1.7, 6];    // perto da entrada da galeria, olhando pra alcova
+let yaw = 0, pitch = 0;
 let lastFrameTime = 0;
 const keys = Object.create(null);
 let dragging = false, lastX = 0, lastY = 0;
+// touch state
+let joystickX = 0, joystickY = 0;     // -1 a 1, atualizado pelo joystick virtual
+let touchUp = false, touchDown = false;
+let lookTouchId = null, joystickTouchId = null;
+let lookLastX = 0, lookLastY = 0;
 const roomLabel = document.getElementById('room-label');
 
 canvas.addEventListener('mousedown', e => {
@@ -697,6 +778,107 @@ window.addEventListener('keydown', e => {
 }, { passive: false });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 
+// ---------- touch controls (joystick + drag pra olhar + up/down) ----------
+const joystickEl = document.getElementById('joystick');
+const joystickThumbEl = document.getElementById('joystick-thumb');
+const btnUpEl = document.getElementById('btn-up');
+const btnDownEl = document.getElementById('btn-down');
+
+function updateJoystick(touch) {
+  const rect = joystickEl.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  let dx = touch.clientX - cx;
+  let dy = touch.clientY - cy;
+  const max = rect.width / 2;
+  const dist = Math.hypot(dx, dy);
+  if (dist > max) { dx = dx * max / dist; dy = dy * max / dist; }
+  joystickX =  dx / max;
+  joystickY = -dy / max; // tela tem y pra baixo; queremos pra cima = forward
+  joystickThumbEl.style.transform = `translate(${dx}px, ${dy}px)`;
+}
+
+if (joystickEl) {
+  joystickEl.addEventListener('touchstart', e => {
+    if (joystickTouchId !== null) return;
+    const t = e.changedTouches[0];
+    joystickTouchId = t.identifier;
+    updateJoystick(t);
+    e.preventDefault();
+  }, { passive: false });
+}
+
+window.addEventListener('touchmove', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joystickTouchId) {
+      updateJoystick(t);
+      e.preventDefault();
+    } else if (t.identifier === lookTouchId) {
+      const dx = t.clientX - lookLastX;
+      const dy = t.clientY - lookLastY;
+      yaw   -= dx * 0.005;
+      pitch -= dy * 0.005;
+      const limit = Math.PI / 2 - 0.05;
+      pitch = Math.max(-limit, Math.min(limit, pitch));
+      lookLastX = t.clientX;
+      lookLastY = t.clientY;
+      e.preventDefault();
+    }
+  }
+}, { passive: false });
+
+window.addEventListener('touchend', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joystickTouchId) {
+      joystickTouchId = null;
+      joystickX = 0; joystickY = 0;
+      joystickThumbEl.style.transform = 'translate(0,0)';
+    } else if (t.identifier === lookTouchId) {
+      lookTouchId = null;
+    }
+  }
+});
+window.addEventListener('touchcancel', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joystickTouchId) {
+      joystickTouchId = null;
+      joystickX = 0; joystickY = 0;
+      joystickThumbEl.style.transform = 'translate(0,0)';
+    } else if (t.identifier === lookTouchId) {
+      lookTouchId = null;
+    }
+  }
+});
+
+// drag-pra-olhar: pega touches no canvas que NÃO sejam do joystick/botões
+canvas.addEventListener('touchstart', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joystickTouchId) continue;
+    if (lookTouchId === null) {
+      lookTouchId = t.identifier;
+      lookLastX = t.clientX;
+      lookLastY = t.clientY;
+      e.preventDefault();
+      break;
+    }
+  }
+}, { passive: false });
+
+// up / down botões
+function bindHoldBtn(el, onDown, onUp) {
+  if (!el) return;
+  const start = e => { onDown(); el.classList.add('pressed'); e.preventDefault(); };
+  const end   = () => { onUp();   el.classList.remove('pressed'); };
+  el.addEventListener('touchstart', start, { passive: false });
+  el.addEventListener('touchend',   end);
+  el.addEventListener('touchcancel', end);
+  el.addEventListener('mousedown',  start);
+  el.addEventListener('mouseup',    end);
+  el.addEventListener('mouseleave', end);
+}
+bindHoldBtn(btnUpEl,   () => touchUp = true,   () => touchUp = false);
+bindHoldBtn(btnDownEl, () => touchDown = true, () => touchDown = false);
+
 function applyMovement(dt) {
   let moved = false;
   const fast = keys.ShiftLeft || keys.ShiftRight;
@@ -712,6 +894,16 @@ function applyMovement(dt) {
   if (keys.KeyA) { camPos[0] -= rx*speed; camPos[2] -= rz*speed; moved = true; }
   if (keys.KeyE || keys.Space) { camPos[1] += speed; moved = true; }
   if (keys.KeyQ) { camPos[1] -= speed; moved = true; }
+  // joystick virtual: y = forward/back, x = strafe
+  if (joystickX !== 0 || joystickY !== 0) {
+    const fAmt = joystickY * speed;
+    const rAmt = joystickX * speed;
+    camPos[0] += fx*fAmt + rx*rAmt;
+    camPos[2] += fz*fAmt + rz*rAmt;
+    moved = true;
+  }
+  if (touchUp)   { camPos[1] += speed; moved = true; }
+  if (touchDown) { camPos[1] -= speed; moved = true; }
   return moved;
 }
 window.addEventListener('keydown', e => {
@@ -783,6 +975,8 @@ const ltResetBtn = document.getElementById('lt-reset');
 if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
   photonHead = 0;
   photonCount = 0;
+  splatLastViewKey = null;
+  splatHeadAtLastDraw = 0;
 });
 
 const ltBufferEl = document.getElementById('lt-buffer-val');
@@ -816,6 +1010,7 @@ function frame() {
   lastFrameTime = now;
 
   applyMovement(dt);
+  tickAnimation(now * 0.001);
   const newRoomId = setActiveRoomByPos(camPos);
   if (newRoomId !== lastRoomId) {
     // mudou de cômodo: só atualiza HUD. Buffer persiste — fótons de todas
@@ -832,6 +1027,7 @@ function frame() {
   if (mode === 'wireframe')       drawWireframe(view);
   else if (mode === 'shaded')     drawShaded(view);
   else if (mode === 'lighttrace') drawLightTrace(view);
+  drawDynamicOverlay(view);
 
   rafId = requestAnimationFrame(frame);
 }

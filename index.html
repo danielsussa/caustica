@@ -2,10 +2,48 @@
 <html lang="pt-br">
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>3D Render — experimento</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font-family: monospace; }
-  #screen { display: block; width: 100vw; height: 100vh; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font-family: monospace; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  #screen { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  /* touch controls */
+  #joystick {
+    position: fixed; bottom: 24px; left: 24px;
+    width: 110px; height: 110px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 50%;
+    touch-action: none;
+    z-index: 10;
+  }
+  #joystick-thumb {
+    position: absolute; left: 50%; top: 50%;
+    width: 44px; height: 44px;
+    margin: -22px 0 0 -22px;
+    background: rgba(255,255,255,0.20);
+    border: 1px solid rgba(255,255,255,0.35);
+    border-radius: 50%;
+    pointer-events: none;
+    transition: transform 0.05s linear;
+  }
+  .vbtn {
+    position: fixed; right: 24px;
+    width: 56px; height: 56px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.20);
+    border-radius: 50%;
+    color: #ddd; font-size: 20px; font-family: inherit;
+    touch-action: none;
+    z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+  }
+  #btn-up   { bottom: 100px; }
+  #btn-down { bottom: 24px; }
+  .vbtn.pressed { background: rgba(255,255,255,0.20); }
+  /* esconde controles touch em desktops com mouse — escolha de UI: deixar
+     sempre visíveis pra ser óbvio que existem. Pode trocar pra @media. */
   .hud {
     position: fixed; left: 12px; bottom: 12px;
     font-size: 12px; opacity: 0.6; pointer-events: none;
@@ -39,8 +77,11 @@
 </head>
 <body>
   <canvas id="screen"></canvas>
+  <div id="joystick"><div id="joystick-thumb"></div></div>
+  <div class="vbtn" id="btn-up">↑</div>
+  <div class="vbtn" id="btn-down">↓</div>
   <div class="hud">
-    modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wireframe/shaded · <b>L</b> lighttrace · <b>WASD</b> andar · <b>Q/E</b> baixo/cima · <b>shift</b> rápido · drag pra olhar · fps: <b id="fps">--</b>
+    modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wireframe/shaded · <b>L</b> lighttrace · <b>WASD</b> ou joystick · <b>Q/E</b> ou ↑↓ · <b>shift</b> rápido · drag/touch pra olhar · fps: <b id="fps">--</b>
   </div>
   <div id="lt-panel">
     <h4>lighttrace params</h4>

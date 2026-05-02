@@ -28,28 +28,7 @@ const M_LIGHT   = 1;
 const D = albedo  => ({ kind: M_DIFFUSE, albedo });
 const L = emission => ({ kind: M_LIGHT,   emission });
 
-// paletas por cômodo
-const matsA = {
-  floor:   D([0.55, 0.40, 0.32]), // marrom-madeira
-  ceiling: D([0.85, 0.78, 0.70]), // creme
-  wall:    D([0.60, 0.20, 0.18]), // vermelho escuro
-  pillar:  D([0.85, 0.75, 0.40]), // amarelo
-  sphere:  D([0.30, 0.50, 0.80]), // azul
-};
-const matsB = {
-  floor:   D([0.55, 0.55, 0.55]), // cinza claro
-  ceiling: D([0.85, 0.85, 0.85]), // branco
-  wall:    D([0.70, 0.68, 0.62]), // bege neutro
-  pedestal: D([0.85, 0.85, 0.85]),
-  sphere:  D([0.30, 0.85, 0.85]), // ciano
-};
-const matsC = {
-  floor:   D([0.30, 0.32, 0.38]), // cinza escuro
-  ceiling: D([0.78, 0.82, 0.90]), // azul claro
-  wall:    D([0.18, 0.28, 0.55]), // azul profundo
-  table:   D([0.50, 0.35, 0.25]), // madeira
-  sphere:  D([0.85, 0.45, 0.55]), // rosa
-};
+// (matsA/B/C removidos junto com os 3 cômodos antigos)
 
 // ---------- helpers de geometria ----------
 function pushQuad(tris, p0, p1, p2, p3, mat) {
@@ -142,41 +121,210 @@ function buildRoom(id, min, max, doors, mats, objects, light, lightRgb) {
   };
 }
 
-const DOOR = { perp: [-1, 1], y: [0, 2.5] };
+// ---------- helpers de cena (suportam buildGallery e futuras cenas) ----------
+function newRoom(id, min, max) {
+  return {
+    id, bounds: { min, max },
+    tris: [], sphs: [], lights: [],
+    visual: { quads: [], boxes: [], spheres: [], lights: [] },
+  };
+}
+function rmAddQuad(room, p0, p1, p2, p3, mat) {
+  pushQuad(room.tris, p0, p1, p2, p3, mat);
+  room.visual.quads.push({ p0, p1, p2, p3, rgb: albToRgb(mat.albedo) });
+}
+function rmAddBox(room, min, max, mat) {
+  addBoxTris(room.tris, min, max, mat);
+  room.visual.boxes.push({ min: min.slice(), max: max.slice(), rgb: albToRgb(mat.albedo) });
+}
+function rmAddSph(room, c, r, mat) {
+  room.sphs.push({ c, r, mat });
+  room.visual.spheres.push({ c: c.slice(), r, rgb: albToRgb(mat.albedo) });
+}
+function rmAddLight(room, c, r, emission, lightRgb) {
+  room.lights.push({ kind: 'sphere', c, r, emission });
+  room.visual.lights.push({ kind: 'sphere', c: c.slice(), r, rgb: lightRgb });
+}
+// quad light: p0,p1,p2,p3 em CCW vista do lado emissivo. Normal = cross(p1-p0, p3-p0)
+function rmAddQuadLight(room, p0, p1, p2, p3, emission, lightRgb) {
+  const u = sub(p1, p0);
+  const v = sub(p3, p0);
+  const c = cross(u, v);
+  const area = Math.hypot(c[0], c[1], c[2]);
+  const n = [c[0]/area, c[1]/area, c[2]/area];
+  room.lights.push({ kind: 'quad', p0, p1, p2, p3, n, area, emission });
+  room.visual.lights.push({ kind: 'quad', p0, p1, p2, p3, rgb: lightRgb });
+}
 
-const roomA = buildRoom('A', [-10, 0, -4], [-2, 5, 4],
-  { east: DOOR, west: null, north: null, south: null }, matsA,
-  [
-    { kind: 'box',    min: [-8.5, 0, -3], max: [-8.0, 3.0, -2.5], mat: matsA.pillar },
-    { kind: 'sphere', c: [-7, 0.7, 1.5], r: 0.7, mat: matsA.sphere },
-  ],
-  { c: [-6, 4.5, 0], r: 0.25, emission: [42, 32, 22] },
-  [255, 220, 150],
-);
+// ---------- cena: galeria de museu (~1000 tris) ----------
+function buildGallery() {
+  // Sala 8m × 5m × 16m (z é comprimento)
+  const room = newRoom('Gallery', [-4, 0, -8], [4, 5, 8]);
 
-const roomB = buildRoom('B', [-2, 0, -4], [2, 5, 4],
-  { east: DOOR, west: DOOR, north: null, south: null }, matsB,
-  [
-    { kind: 'box',    min: [0.4, 0, 1.2], max: [1.6, 0.7, 2.4], mat: matsB.pedestal },
-    { kind: 'sphere', c: [1.0, 1.15, 1.8], r: 0.45, mat: matsB.sphere },
-  ],
-  { c: [0, 4.5, -1], r: 0.22, emission: [38, 38, 36] },
-  [240, 240, 230],
-);
+  // === paleta ===
+  const matFloor1   = D([0.50, 0.36, 0.22]);
+  const matFloor2   = D([0.58, 0.42, 0.28]);
+  const matCeil     = D([0.92, 0.92, 0.86]);
+  const matWall     = D([0.45, 0.10, 0.13]); // crimson
+  const matWainscot = D([0.92, 0.88, 0.78]);
+  const matFrameG   = D([0.78, 0.62, 0.25]); // ouro
+  const matCanvas1  = D([0.30, 0.22, 0.16]);
+  const matCanvas2  = D([0.55, 0.42, 0.30]);
+  const matCanvas3  = D([0.45, 0.45, 0.50]);
+  const matCanvas4  = D([0.65, 0.55, 0.45]);
+  const matCanvas5  = D([0.40, 0.30, 0.25]);
+  const matBench    = D([0.22, 0.13, 0.08]);
+  const matTable    = D([0.28, 0.18, 0.10]);
+  const matAltar    = D([0.92, 0.90, 0.85]);
+  const matCrucifix = D([0.62, 0.50, 0.22]);
+  const matStatue   = D([0.28, 0.22, 0.14]);
+  const matTrim     = D([0.85, 0.83, 0.75]);
 
-const roomC = buildRoom('C', [2, 0, -4], [10, 5, 4],
-  { east: null, west: DOOR, north: null, south: null }, matsC,
-  [
-    { kind: 'box',    min: [4.5, 0, -2.5], max: [8.5, 0.5, 1], mat: matsC.table },
-    { kind: 'sphere', c: [5.2, 0.85, -1.5], r: 0.35, mat: matsC.sphere },
-    { kind: 'sphere', c: [6.5, 0.85,  0.0], r: 0.35, mat: matsC.sphere },
-    { kind: 'sphere', c: [8.0, 0.85, -2.0], r: 0.35, mat: matsC.sphere },
-  ],
-  { c: [7, 4.5, 1.5], r: 0.25, emission: [22, 30, 42] },
-  [180, 200, 255],
-);
+  // === chão parquet (1m × 2m, 8×8 = 64 placas, alternando 2 tons) ===
+  for (let zi = 0; zi < 8; zi++) {
+    for (let xi = 0; xi < 8; xi++) {
+      const x0 = -4 + xi, x1 = x0 + 1;
+      const z0 = -8 + zi*2, z1 = z0 + 2;
+      const m = ((xi + zi) & 1) ? matFloor1 : matFloor2;
+      rmAddQuad(room, [x0, 0, z0], [x1, 0, z0], [x1, 0, z1], [x0, 0, z1], m);
+    }
+  }
 
-export const rooms = [roomA, roomB, roomC];
+  // === teto (4×8 panels com leve variação pra coffer feel) ===
+  for (let zi = 0; zi < 8; zi++) {
+    for (let xi = 0; xi < 4; xi++) {
+      const x0 = -4 + xi*2, x1 = x0 + 2;
+      const z0 = -8 + zi*2, z1 = z0 + 2;
+      rmAddQuad(room, [x0, 5, z0], [x0, 5, z1], [x1, 5, z1], [x1, 5, z0], matCeil);
+    }
+  }
+
+  // === paredes laterais (split em wainscoting + parte vermelha) ===
+  // West (x=-4)
+  rmAddQuad(room, [-4, 0, -8], [-4, 1, -8], [-4, 1, 8], [-4, 0, 8], matWainscot);
+  rmAddQuad(room, [-4, 1, -8], [-4, 5, -8], [-4, 5, 8], [-4, 1, 8], matWall);
+  // East (x=+4)
+  rmAddQuad(room, [4, 0, -8], [4, 0, 8], [4, 1, 8], [4, 1, -8], matWainscot);
+  rmAddQuad(room, [4, 1, -8], [4, 1, 8], [4, 5, 8], [4, 5, -8], matWall);
+  // South (z=+8) - entrada
+  rmAddQuad(room, [-4, 0, 8], [4, 0, 8], [4, 1, 8], [-4, 1, 8], matWainscot);
+  rmAddQuad(room, [-4, 1, 8], [4, 1, 8], [4, 5, 8], [-4, 5, 8], matWall);
+
+  // === parede de fundo (z=-8) com alcova ===
+  // wainscot full
+  rmAddQuad(room, [-4, 0, -8], [4, 0, -8], [4, 1, -8], [-4, 1, -8], matWainscot);
+  // upper wall: 3 tiras em volta do buraco da alcova (x ∈ [-1.2, 1.2], y ∈ [1, 4])
+  rmAddQuad(room, [-4, 1, -8], [-1.2, 1, -8], [-1.2, 5, -8], [-4, 5, -8], matWall);
+  rmAddQuad(room, [1.2, 1, -8], [4, 1, -8], [4, 5, -8], [1.2, 5, -8], matWall);
+  rmAddQuad(room, [-1.2, 4, -8], [1.2, 4, -8], [1.2, 5, -8], [-1.2, 5, -8], matWall);
+  // alcova interior (recesso até z=-9)
+  rmAddQuad(room, [-1.2, 1, -9], [1.2, 1, -9], [1.2, 4, -9], [-1.2, 4, -9], matAltar); // back
+  rmAddQuad(room, [-1.2, 1, -9], [-1.2, 4, -9], [-1.2, 4, -8], [-1.2, 1, -8], matAltar); // left
+  rmAddQuad(room, [1.2, 1, -8], [1.2, 4, -8], [1.2, 4, -9], [1.2, 1, -9], matAltar);     // right
+  rmAddQuad(room, [-1.2, 4, -9], [-1.2, 4, -8], [1.2, 4, -8], [1.2, 4, -9], matAltar);   // top
+  rmAddQuad(room, [-1.2, 1, -9], [-1.2, 1, -8], [1.2, 1, -8], [1.2, 1, -9], matAltar);   // bottom
+
+  // === itens da alcova ===
+  rmAddBox(room, [-1.0, 1.0, -8.9], [1.0, 1.4, -8.3], matAltar);                  // altar block
+  rmAddBox(room, [-0.05, 1.4, -8.85], [0.05, 3.0, -8.75], matCrucifix);          // crucifix vertical
+  rmAddBox(room, [-0.4, 2.4, -8.85], [0.4, 2.55, -8.75], matCrucifix);            // cross arm
+  rmAddBox(room, [-0.85, 1.4, -8.85], [-0.65, 1.7, -8.7], matAltar);              // statue base L
+  rmAddBox(room, [0.65, 1.4, -8.85], [0.85, 1.7, -8.7], matAltar);                // statue base R
+  rmAddBox(room, [-0.82, 1.7, -8.83], [-0.68, 2.5, -8.72], matStatue);            // statue L
+  rmAddBox(room, [0.68, 1.7, -8.83], [0.82, 2.5, -8.72], matStatue);              // statue R
+  rmAddBox(room, [-0.30, 1.4, -8.85], [-0.20, 1.6, -8.75], matCrucifix);          // candle L
+  rmAddBox(room, [0.20, 1.4, -8.85], [0.30, 1.6, -8.75], matCrucifix);            // candle R
+
+  // === pilastras (4 por parede lateral, no z = -6, -2, 2, 6) ===
+  for (const z of [-6, -2, 2, 6]) {
+    rmAddBox(room, [-4.0, 0, z - 0.15], [-3.85, 4.5, z + 0.15], matWainscot);
+    rmAddBox(room, [3.85, 0, z - 0.15], [4.0, 4.5, z + 0.15], matWainscot);
+  }
+
+  // === quadros nas paredes laterais ===
+  // West (5 quadros nos 5 vãos entre pilastras)
+  const westPaintings = [
+    { z: -7, w: 1.4, h: 1.6, m: matCanvas1 },
+    { z: -4, w: 2.0, h: 2.2, m: matCanvas2 },
+    { z:  0, w: 1.8, h: 2.0, m: matCanvas3 },
+    { z:  4, w: 1.5, h: 1.8, m: matCanvas4 },
+    { z:  7, w: 1.4, h: 1.6, m: matCanvas5 },
+  ];
+  for (const p of westPaintings) {
+    const yc = 2.6, hw = p.w * 0.5, hh = p.h * 0.5;
+    rmAddBox(room, [-3.95, yc - hh, p.z - hw], [-3.85, yc + hh, p.z + hw], matFrameG);
+    rmAddBox(room, [-3.91, yc - hh + 0.12, p.z - hw + 0.12],
+                   [-3.83, yc + hh - 0.12, p.z + hw - 0.12], p.m);
+  }
+  // East (5 quadros)
+  const eastPaintings = [
+    { z: -7, w: 1.4, h: 1.6, m: matCanvas2 },
+    { z: -4, w: 1.6, h: 1.9, m: matCanvas3 },
+    { z:  0, w: 1.8, h: 2.0, m: matCanvas4 },
+    { z:  4, w: 2.0, h: 2.2, m: matCanvas5 },
+    { z:  7, w: 1.5, h: 1.7, m: matCanvas1 },
+  ];
+  for (const p of eastPaintings) {
+    const yc = 2.6, hw = p.w * 0.5, hh = p.h * 0.5;
+    rmAddBox(room, [3.85, yc - hh, p.z - hw], [3.95, yc + hh, p.z + hw], matFrameG);
+    rmAddBox(room, [3.83, yc - hh + 0.12, p.z - hw + 0.12],
+                   [3.91, yc + hh - 0.12, p.z + hw - 0.12], p.m);
+  }
+
+  // === bancos (2: centro + sul) ===
+  for (const bz of [0, 5]) {
+    rmAddBox(room, [-0.75, 0.4, bz - 0.3], [0.75, 0.45, bz + 0.3], matBench);
+    rmAddBox(room, [-0.7, 0, bz - 0.25], [-0.6, 0.4, bz - 0.15], matBench);
+    rmAddBox(room, [0.6, 0, bz - 0.25], [0.7, 0.4, bz - 0.15], matBench);
+    rmAddBox(room, [-0.7, 0, bz + 0.15], [-0.6, 0.4, bz + 0.25], matBench);
+    rmAddBox(room, [0.6, 0, bz + 0.15], [0.7, 0.4, bz + 0.25], matBench);
+  }
+
+  // === mesa pequena no canto sudoeste ===
+  rmAddBox(room, [-3.5, 0.55, 5.4], [-2.5, 0.6, 6.1], matTable);
+  rmAddBox(room, [-3.45, 0, 5.45], [-3.35, 0.55, 5.55], matTable);
+  rmAddBox(room, [-2.65, 0, 5.45], [-2.55, 0.55, 5.55], matTable);
+  rmAddBox(room, [-3.45, 0, 5.95], [-3.35, 0.55, 6.05], matTable);
+  rmAddBox(room, [-2.65, 0, 5.95], [-2.55, 0.55, 6.05], matTable);
+
+  // === trim ===
+  // chair rail at y=1.0 (decorativo, fino)
+  rmAddBox(room, [-4.0, 0.95, -8], [-3.95, 1.05, 8], matTrim);
+  rmAddBox(room, [3.95, 0.95, -8], [4.0, 1.05, 8], matTrim);
+  rmAddBox(room, [-4, 0.95, -8], [4, 1.05, -7.95], matTrim);
+  rmAddBox(room, [-4, 0.95, 7.95], [4, 1.05, 8], matTrim);
+  // cornija/cove shelf: 0.3m wide, projeta da parede e ESCONDE as cove lights abaixo
+  rmAddBox(room, [-4.0, 4.5, -8], [-3.7, 4.7, 8], matTrim);     // west cornice
+  rmAddBox(room, [3.7, 4.5, -8], [4.0, 4.7, 8], matTrim);       // east cornice
+  rmAddBox(room, [-4, 4.5, -8], [4, 4.7, -7.7], matTrim);       // north cornice
+  rmAddBox(room, [-4, 4.5, 7.7], [4, 4.7, 8], matTrim);         // south cornice
+
+  // === luzes ===
+  // Cove lights: planares ao longo do topo das paredes laterais, em cima
+  // da cornija, apontando UP. Escondidas da visão direta da galeria — só
+  // o teto recebe luz direta, e ele reflete difusa pra todo lugar.
+  rmAddQuadLight(room,
+    [-3.7, 4.85, -7.5], [-3.95, 4.85, -7.5],
+    [-3.95, 4.85,  7.5], [-3.7, 4.85,  7.5],
+    [22, 18, 12], [255, 230, 180],
+  );
+  rmAddQuadLight(room,
+    [3.95, 4.85, -7.5], [3.7, 4.85, -7.5],
+    [3.7, 4.85,  7.5], [3.95, 4.85,  7.5],
+    [22, 18, 12], [255, 230, 180],
+  );
+  // Luz hidden na alcova (atrás do altar, ilumina crucifixo+estátuas de
+  // baixo pra cima). Visível só de dentro da alcova.
+  rmAddQuadLight(room,
+    [ 0.9, 1.41, -8.7], [-0.9, 1.41, -8.7],
+    [-0.9, 1.41, -8.4], [ 0.9, 1.41, -8.4],
+    [38, 28, 16], [255, 220, 150],
+  );
+
+  return room;
+}
+
+export const rooms = [buildGallery()];
 
 // arrays planos com tudo de todos os cômodos. Usados nos intersects pra
 // permitir fótons atravessarem portas. Cômodos longe são naturalmente
@@ -188,6 +336,54 @@ for (const r of rooms) {
   for (const t of r.tris)   allTris.push(t);
   for (const s of r.sphs)   allSphs.push(s);
   for (const l of r.lights) allLights.push(l);
+}
+
+// ---------- objetos animados ----------
+// Listas separadas (não entram no BVH). Intersect brute force, são poucos.
+// Posições são atualizadas em tickAnimation(t) toda frame.
+const dynamicSphs = [];      // esferas difusas animadas
+const dynamicEntries = [];   // {update: t => void}
+const dynamicVisual = [];    // pra raster overlay: {kind, c, r, rgb}
+
+function addAnimatedSphere(initC, r, mat, animFn) {
+  const c = initC.slice();
+  const item = { c, r, mat };
+  dynamicSphs.push(item);
+  dynamicVisual.push({ kind: 'sphere', c, r, rgb: albToRgb(mat.albedo) });
+  dynamicEntries.push({ update(t) {
+    const nc = animFn(t);
+    c[0] = nc[0]; c[1] = nc[1]; c[2] = nc[2];
+  }});
+}
+
+function addAnimatedLight(initC, r, emission, lightRgb, animFn) {
+  const c = initC.slice();
+  const lt = { kind: 'sphere', c, r, emission };
+  allLights.push(lt);
+  dynamicEntries.push({ update(t) {
+    const nc = animFn(t);
+    c[0] = nc[0]; c[1] = nc[1]; c[2] = nc[2];
+  }});
+  dynamicVisual.push({ kind: 'light', c, r, rgb: lightRgb });
+  return lt;
+}
+
+addAnimatedSphere(
+  [-2, 0.5, -5], 0.4,
+  D([0.95, 0.50, 0.18]),
+  t => [-2, 0.5 + Math.abs(Math.sin(t * 1.6)) * 1.6, -5],
+);
+addAnimatedLight(
+  [1.8, 3.0, 0], 0.16,
+  [10, 18, 30], [160, 200, 255],
+  t => [1.8 * Math.cos(t * 0.6), 3.0, 1.8 * Math.sin(t * 0.6)],
+);
+
+export function tickAnimation(t) {
+  for (const e of dynamicEntries) e.update(t);
+}
+export function getDynamicVisuals() {
+  return dynamicVisual;
 }
 
 // ---------- BVH (median-split, leaf size 4) ----------
@@ -405,15 +601,37 @@ function intersectScene(ro, rd) {
       }
     }
   }
-  // luzes ficam fora do BVH (só ~3, brute é igual)
+  // dynamic spheres (não estão no BVH; brute force, poucas)
+  for (let i = 0; i < dynamicSphs.length; i++) {
+    const s = dynamicSphs[i];
+    const t = intersectSphere(s, ro, rd);
+    if (t < hit.t) {
+      hit.t = t;
+      hit.mat = s.mat;
+      const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
+      hit.n = norm([px - s.c[0], py - s.c[1], pz - s.c[2]]);
+    }
+  }
+  // luzes ficam fora do BVH (poucas, brute é igual). Dispatch por kind.
   for (let i = 0; i < allLights.length; i++) {
     const lt = allLights[i];
-    const t = intersectSphere(lt, ro, rd);
+    let t;
+    if (lt.kind === 'quad') {
+      const t1 = intersectTri({ v0: lt.p0, v1: lt.p1, v2: lt.p2 }, ro, rd);
+      const t2 = intersectTri({ v0: lt.p0, v1: lt.p2, v2: lt.p3 }, ro, rd);
+      t = Math.min(t1, t2);
+    } else {
+      t = intersectSphere(lt, ro, rd);
+    }
     if (t < hit.t) {
       hit.t = t;
       hit.mat = { kind: M_LIGHT, emission: lt.emission };
-      const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
-      hit.n = norm([px - lt.c[0], py - lt.c[1], pz - lt.c[2]]);
+      if (lt.kind === 'quad') {
+        hit.n = lt.n;
+      } else {
+        const px = ro[0]+t*rd[0], py = ro[1]+t*rd[1], pz = ro[2]+t*rd[2];
+        hit.n = norm([px - lt.c[0], py - lt.c[1], pz - lt.c[2]]);
+      }
     }
   }
   return hit;
@@ -421,13 +639,18 @@ function intersectScene(ro, rd) {
 
 function occluded(ro, rd, maxT) {
   if (useBVH) {
-    return bvhAnyHit(bvhRoot, ro, rd, 1/rd[0], 1/rd[1], 1/rd[2], maxT);
+    if (bvhAnyHit(bvhRoot, ro, rd, 1/rd[0], 1/rd[1], 1/rd[2], maxT)) return true;
+  } else {
+    for (let i = 0; i < allTris.length; i++) {
+      if (intersectTri(allTris[i], ro, rd) < maxT) return true;
+    }
+    for (let i = 0; i < allSphs.length; i++) {
+      if (intersectSphere(allSphs[i], ro, rd) < maxT) return true;
+    }
   }
-  for (let i = 0; i < allTris.length; i++) {
-    if (intersectTri(allTris[i], ro, rd) < maxT) return true;
-  }
-  for (let i = 0; i < allSphs.length; i++) {
-    if (intersectSphere(allSphs[i], ro, rd) < maxT) return true;
+  // dynamic sempre brute force
+  for (let i = 0; i < dynamicSphs.length; i++) {
+    if (intersectSphere(dynamicSphs[i], ro, rd) < maxT) return true;
   }
   return false;
 }
@@ -453,20 +676,29 @@ function sampleCosineHemisphere(n) {
 }
 
 // ---------- direct lighting (NEE) ----------
-// Sample uniforme entre todas as luzes do mundo (1/N pdf, compensa
-// multiplicando contribuição por N).
+// Sample uniforme entre todas as luzes (1/N pdf, factor *= N pra compensar).
+// Dispatch por kind: sphere = uniform em superfície; quad = uniform em área.
 function directLight(p, n, albedo) {
   const lt = allLights[(Math.random() * allLights.length) | 0];
-  const lightArea = 4 * Math.PI * lt.r * lt.r;
-  const u1 = Math.random();
-  const u2 = Math.random();
-  const z = 1 - 2 * u1;
-  const r = Math.sqrt(Math.max(0, 1 - z*z));
-  const phi = 2 * Math.PI * u2;
-  const lnx = r * Math.cos(phi), lny = z, lnz = r * Math.sin(phi);
-  const lpx = lt.c[0] + lt.r * lnx;
-  const lpy = lt.c[1] + lt.r * lny;
-  const lpz = lt.c[2] + lt.r * lnz;
+  let lpx, lpy, lpz, lightArea, lnx, lny, lnz;
+  if (lt.kind === 'quad') {
+    const u = Math.random(), v = Math.random();
+    lpx = lt.p0[0] + u*(lt.p1[0]-lt.p0[0]) + v*(lt.p3[0]-lt.p0[0]);
+    lpy = lt.p0[1] + u*(lt.p1[1]-lt.p0[1]) + v*(lt.p3[1]-lt.p0[1]);
+    lpz = lt.p0[2] + u*(lt.p1[2]-lt.p0[2]) + v*(lt.p3[2]-lt.p0[2]);
+    lightArea = lt.area;
+    lnx = lt.n[0]; lny = lt.n[1]; lnz = lt.n[2];
+  } else {
+    const u1 = Math.random(), u2 = Math.random();
+    const z = 1 - 2 * u1;
+    const r = Math.sqrt(Math.max(0, 1 - z*z));
+    const phi = 2 * Math.PI * u2;
+    lnx = r * Math.cos(phi); lny = z; lnz = r * Math.sin(phi);
+    lpx = lt.c[0] + lt.r * lnx;
+    lpy = lt.c[1] + lt.r * lny;
+    lpz = lt.c[2] + lt.r * lnz;
+    lightArea = 4 * Math.PI * lt.r * lt.r;
+  }
   const dx = lpx - p[0], dy = lpy - p[1], dz = lpz - p[2];
   const distSq = dx*dx + dy*dy + dz*dz;
   const dist = Math.sqrt(distSq);
@@ -476,7 +708,6 @@ function directLight(p, n, albedo) {
   const cosLight = -(lnx*wx + lny*wy + lnz*wz);
   if (cosLight <= 0) return [0,0,0];
   if (occluded(p, [wx,wy,wz], dist - 1e-3)) return [0,0,0];
-  // factor inclui N (allLights.length) pra compensar pdf 1/N de seleção uniforme
   const factor = (lightArea * cosSurf * cosLight * allLights.length) / (Math.PI * distSq);
   return [
     albedo[0] * lt.emission[0] * factor,
@@ -595,19 +826,30 @@ export function tracePhotonPath(maxBounces = 4, emissionVar = 0, applyDecay = fa
   const points = [];
   const colors = [];
   const intensities = [];
-  // sorteia uma luz uniformemente entre todas. Isso dispersa fótons de
-  // todos os cômodos pelo buffer; cômodos longe são naturalmente fog-culled.
+  // sorteia uma luz uniformemente. Sphere → uniform em superfície,
+  // quad → uniform em área. Direção sempre cosine-weighted da normal.
   const lt = allLights[(Math.random() * allLights.length) | 0];
   const me = Math.max(lt.emission[0], lt.emission[1], lt.emission[2]);
   const lightColor = [lt.emission[0]/me, lt.emission[1]/me, lt.emission[2]/me];
 
-  const u1 = Math.random(), u2 = Math.random();
-  const z = 1 - 2*u1;
-  const rr = Math.sqrt(Math.max(0, 1 - z*z));
-  const phi = 2*Math.PI*u2;
-  const ln = [rr*Math.cos(phi), z, rr*Math.sin(phi)];
-  let pos = [lt.c[0]+lt.r*ln[0], lt.c[1]+lt.r*ln[1], lt.c[2]+lt.r*ln[2]];
-  let dir = sampleCosineHemisphere(ln);
+  let pos, sampleN;
+  if (lt.kind === 'quad') {
+    const u = Math.random(), v = Math.random();
+    pos = [
+      lt.p0[0] + u*(lt.p1[0]-lt.p0[0]) + v*(lt.p3[0]-lt.p0[0]),
+      lt.p0[1] + u*(lt.p1[1]-lt.p0[1]) + v*(lt.p3[1]-lt.p0[1]),
+      lt.p0[2] + u*(lt.p1[2]-lt.p0[2]) + v*(lt.p3[2]-lt.p0[2]),
+    ];
+    sampleN = lt.n;
+  } else {
+    const u1 = Math.random(), u2 = Math.random();
+    const z = 1 - 2*u1;
+    const rr = Math.sqrt(Math.max(0, 1 - z*z));
+    const phi = 2*Math.PI*u2;
+    sampleN = [rr*Math.cos(phi), z, rr*Math.sin(phi)];
+    pos = [lt.c[0]+lt.r*sampleN[0], lt.c[1]+lt.r*sampleN[1], lt.c[2]+lt.r*sampleN[2]];
+  }
+  let dir = sampleCosineHemisphere(sampleN);
   let energy = 1.0;
   if (emissionVar > 0) {
     energy = 1 + (Math.random()*2 - 1) * emissionVar;
