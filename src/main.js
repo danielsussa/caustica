@@ -316,7 +316,7 @@ let ltFog           = true;
 let ltColorByBounce = false;
 let ltLineFirstOnly = false;
 let ltGaussian      = false;
-let ltContoursIntensity = 0; // 0 = off, 1 = max
+let contourPower = 0; // 0..1, controlado dinamicamente
 let ltPhysicalDecay = false;
 let ltEmissionVar   = 0;     // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
 const FOG_STRENGTH        = 0.06;
@@ -353,17 +353,16 @@ const projValid = new Uint8Array(MAX_PATHS * MAX_POINTS);
 // nunca encolher. Em prática ~80 entries.
 const segmentBuckets = new Map();
 
-// ---------- splat layer (acumula enquanto câmera não mexe) ----------
-// Splats vão num canvas separado que persiste. Cada frame só os splats das
-// paths novas são desenhados; quando a view muda, faz redraw completo do
-// buffer atual (splats velhos do buffer wrap são perdidos). Composite
-// aditivo no main canvas.
+// ---------- splat layer ----------
+// Splats acumulam no splatLayer. Fade SÓ é ativado quando câmera muda
+// (timer de 1s). Steady camera = sem fade, splats saturam normalmente.
 const splatLayer = document.createElement('canvas');
 let splatLayerCtx = null;
 let splatLayerW = 0, splatLayerH = 0;
-let splatLastViewKey = null;
 let splatHeadAtLastDraw = 0;
 let splatLastEnabled = false;
+let splatLastViewKey = null;
+let splatFadeTimer = 0; // segundos restantes de fade ativo
 
 function ensureSplatLayer() {
   if (splatLayerW !== W || splatLayerH !== H) {
@@ -371,8 +370,8 @@ function ensureSplatLayer() {
     splatLayer.height = H;
     splatLayerCtx = splatLayer.getContext('2d');
     splatLayerW = W; splatLayerH = H;
-    splatLastViewKey = null;
     splatHeadAtLastDraw = 0;
+    splatLastViewKey = null;
   }
 }
 
@@ -459,21 +458,6 @@ function drawSphereContour(view, center, radius) {
   ctx.stroke();
 }
 
-// overlay de objetos animados — desenhados separados a cada frame com
-// posições atualizadas. Aparecem em todos os modos pra dar feedback visual.
-function drawDynamicOverlay(view) {
-  const visuals = getDynamicVisuals();
-  ctx.lineWidth = 1.5;
-  for (const v of visuals) {
-    const [r, g, b] = v.rgb;
-    ctx.strokeStyle = v.kind === 'light'
-      ? `rgba(${r},${g},${b},0.95)`
-      : `rgba(${r},${g},${b},0.7)`;
-    drawSphereContour(view, v.c, v.r);
-  }
-  ctx.lineWidth = 1;
-}
-
 // cache de splat gaussiano por cor RGB. Calculado preguiçosamente.
 const gaussianCache = new Map();
 function gaussianSplatCanvas(r, g, b) {
@@ -505,7 +489,7 @@ function gaussianSplatCanvas(r, g, b) {
   return canvas;
 }
 
-function drawLightTrace(view) {
+function drawLightTrace(view, dt) {
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
 
@@ -532,11 +516,16 @@ function drawLightTrace(view) {
       ctx.stroke();
     }
   }
-  if (ltContoursIntensity > 0) {
+  // contornos dinâmicos: fade-in rápido quando câmera mexe (splatFadeTimer > 0),
+  // fade-out lento quando para (splats vão acumulando, contorno some)
+  const contourTarget = splatFadeTimer > 0 ? 1 : 0;
+  const contourRate = contourTarget > contourPower ? 2 : 0.5; // ~1.5s in, ~6s out
+  contourPower += (contourTarget - contourPower) * Math.min(1, dt * contourRate);
+  if (contourPower > 0.01) {
     ctx.lineWidth = 1.2;
     for (const obj of scene) {
       const [r, g, b] = obj.rgb;
-      const a = (obj.emissive ? 0.85 : 0.5) * ltContoursIntensity;
+      const a = (obj.emissive ? 0.85 : 0.5) * contourPower;
       ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
       if (obj.kind === 'box') {
         drawBoxContour(view, obj.boxMin, obj.boxMax);
@@ -670,22 +659,34 @@ function drawLightTrace(view) {
   // ao longo do tempo.
   if (ltSplats) {
     ensureSplatLayer();
-    const vk = getSplatViewKey();
     const justEnabled = !splatLastEnabled;
     splatLastEnabled = true;
-    if (justEnabled || vk !== splatLastViewKey) {
+    if (justEnabled) {
       splatLayerCtx.clearRect(0, 0, W, H);
-      drawSplatsToLayer(0, photonCount, useIntensity);
-      splatLastViewKey = vk;
       splatHeadAtLastDraw = photonHead;
-    } else {
-      const newCount = (photonHead - splatHeadAtLastDraw + MAX_PATHS) % MAX_PATHS;
-      if (newCount > 0) {
-        const startSlot = (photonHead - newCount + MAX_PATHS) % MAX_PATHS;
-        drawSplatsToLayer(startSlot, newCount, useIntensity);
-        splatHeadAtLastDraw = photonHead;
-      }
     }
+    // detecta mudança de câmera. Se mudou: ativa fade timer pra 1s.
+    const vk = getSplatViewKey();
+    if (vk !== splatLastViewKey) {
+      splatLastViewKey = vk;
+      splatFadeTimer = 1; // 1 segundo de fade ativo
+    }
+    // fade SÓ enquanto timer ativo. Aggressive fade rate pra apagar em ~1s.
+    if (splatFadeTimer > 0) {
+      splatLayerCtx.globalCompositeOperation = 'destination-out';
+      splatLayerCtx.fillStyle = `rgba(0,0,0,${Math.min(1, dt * 4)})`;
+      splatLayerCtx.fillRect(0, 0, W, H);
+      splatLayerCtx.globalCompositeOperation = 'source-over';
+      splatFadeTimer = Math.max(0, splatFadeTimer - dt);
+    }
+    // adiciona splats das paths novas
+    const newCount = (photonHead - splatHeadAtLastDraw + MAX_PATHS) % MAX_PATHS;
+    if (newCount > 0) {
+      const startSlot = (photonHead - newCount + MAX_PATHS) % MAX_PATHS;
+      drawSplatsToLayer(startSlot, newCount, useIntensity);
+      splatHeadAtLastDraw = photonHead;
+    }
+    // composite simples: 1 layer só, sem soma dupla
     ctx.globalCompositeOperation = 'lighter';
     ctx.drawImage(splatLayer, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
@@ -739,7 +740,8 @@ function drawShaded(view) {
 import {
   tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
   resetIntersectCounters, getIntersectCounters,
-  tickAnimation, getDynamicVisuals,
+  tickAnimation,
+  startPathTracer, stopPathTracer, setPathTracerCamera,
 } from './raytrace.js';
 
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
@@ -915,16 +917,73 @@ window.addEventListener('keydown', e => {
     if (mode === 'pathtrace') return;
     if (mode === 'lighttrace') exitLightTrace();
     else enterLightTrace();
+  } else if (e.key === 'r' || e.key === 'R') {
+    if (mode === 'pathtrace') exitPathTrace();
+    else enterPathTrace();
   }
-  // R (path tracer) desabilitado por enquanto — código preservado em raytrace.js
 });
+
+// ---------- camera helpers (pra path tracer) ----------
+// view = Rx(-pitch) · Ry(-yaw) · T(-camPos)
+// Pra extrair basis world: M = Ry(yaw) · Rx(pitch); right=M·x, up=M·y, fwd=M·-z
+function buildCamera() {
+  const m = matMul(rotY(yaw), rotX(pitch));
+  const fwd   = matVec(m, [0, 0, -1, 0]).slice(0, 3);
+  const right = matVec(m, [1, 0,  0, 0]).slice(0, 3);
+  const up    = matVec(m, [0, 1,  0, 0]).slice(0, 3);
+  return { pos: camPos.slice(), fwd, right, up, fov };
+}
 
 // ---------- transição lighttrace ----------
 const ltPanel = document.getElementById('lt-panel');
+const samplesInfo = document.getElementById('samples-info');
+const samplesEl   = document.getElementById('samples');
+let prevModeBeforePT = 'wireframe';
+let inPathTrace = false;
+let lastPTCamHash = null;
 
 function syncLightTracePanel() {
   if (!ltPanel) return;
   ltPanel.classList.toggle('open', mode === 'lighttrace');
+}
+
+// ---------- transição path tracer ----------
+function enterPathTrace() {
+  prevModeBeforePT = mode;
+  mode = 'pathtrace';
+  inPathTrace = true;
+  syncLightTracePanel();
+
+  // canvas baixa-resolução pra PT rodar em CPU; CSS upscala pixelated
+  const targetW = 480;
+  const ar = window.innerWidth / window.innerHeight;
+  canvas.width = targetW;
+  canvas.height = Math.max(1, Math.round(targetW / ar));
+  canvas.style.imageRendering = 'pixelated';
+  imageData = null;
+  if (modeLabel) modeLabel.textContent = 'path tracer';
+  if (samplesInfo) samplesInfo.style.display = '';
+
+  fpsLastTime = 0;
+  startPathTracer({
+    canvas, ctx,
+    sampleEl: samplesEl,
+    camera: buildCamera(),
+    onTick: tickFPS,
+  });
+  lastPTCamHash = null;
+}
+
+function exitPathTrace() {
+  stopPathTracer();
+  mode = prevModeBeforePT;
+  inPathTrace = false;
+  canvas.style.imageRendering = '';
+  if (samplesInfo) samplesInfo.style.display = 'none';
+  if (modeLabel) modeLabel.textContent = mode;
+  syncLightTracePanel();
+  fpsLastTime = 0;
+  resize();
 }
 
 function enterLightTrace() {
@@ -968,15 +1027,14 @@ bindCheckbox('lt-linefirst',   v => ltLineFirstOnly = v);
 bindCheckbox('lt-physdecay',   v => ltPhysicalDecay = v);
 bindCheckbox('lt-bvh',         v => setUseBVH(v));
 bindCheckbox('lt-wireframe',   v => ltShowWireframe = v);
-bindSlider('lt-contours', 'lt-contours-val', v => ltContoursIntensity = v);
 bindSlider('lt-emission', 'lt-emission-val', v => ltEmissionVar = v);
 
 const ltResetBtn = document.getElementById('lt-reset');
 if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
   photonHead = 0;
   photonCount = 0;
-  splatLastViewKey = null;
   splatHeadAtLastDraw = 0;
+  if (splatLayerCtx) splatLayerCtx.clearRect(0, 0, W, H);
 });
 
 const ltBufferEl = document.getElementById('lt-buffer-val');
@@ -1010,8 +1068,19 @@ function frame() {
   lastFrameTime = now;
 
   applyMovement(dt);
-  tickAnimation(now * 0.001);
+  // animação pausa em PT pra accum convergir; senão cada frame tem cena diferente
+  if (!inPathTrace) tickAnimation(now * 0.001);
   const newRoomId = setActiveRoomByPos(camPos);
+
+  if (inPathTrace) {
+    const camHash = `${camPos[0].toFixed(3)},${camPos[1].toFixed(3)},${camPos[2].toFixed(3)},${yaw.toFixed(4)},${pitch.toFixed(4)}`;
+    if (camHash !== lastPTCamHash) {
+      setPathTracerCamera(buildCamera());
+      lastPTCamHash = camHash;
+    }
+    rafId = requestAnimationFrame(frame);
+    return;
+  }
   if (newRoomId !== lastRoomId) {
     // mudou de cômodo: só atualiza HUD. Buffer persiste — fótons de todas
     // luzes acumulam, fog culling esconde os distantes.
@@ -1026,8 +1095,7 @@ function frame() {
   );
   if (mode === 'wireframe')       drawWireframe(view);
   else if (mode === 'shaded')     drawShaded(view);
-  else if (mode === 'lighttrace') drawLightTrace(view);
-  drawDynamicOverlay(view);
+  else if (mode === 'lighttrace') drawLightTrace(view, dt);
 
   rafId = requestAnimationFrame(frame);
 }
