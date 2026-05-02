@@ -525,7 +525,7 @@ function drawLightTrace(view, dt) {
     ctx.lineWidth = 1.2;
     for (const obj of scene) {
       const [r, g, b] = obj.rgb;
-      const a = (obj.emissive ? 0.85 : 0.5) * contourPower;
+      const a = 0.2 * contourPower;
       ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
       if (obj.kind === 'box') {
         drawBoxContour(view, obj.boxMin, obj.boxMax);
