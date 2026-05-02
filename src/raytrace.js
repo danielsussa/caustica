@@ -1,12 +1,8 @@
 // ======================================================
-// Path tracer + photon tracing com room culling.
-// Mundo: 3 cômodos numa fileira ligados por portas.
-//   Sala A (oeste, vermelha) — corredor B (centro) — Sala C (leste, azul)
-// Cada cômodo tem suas paredes/objetos/luz isolados. setActiveRoomByPos()
-// detecta em qual cômodo a câmera está e os intersect/photon usam só
-// aquele subset. Cômodos ocultos custam zero.
-//
-// Path tracer existe mas o main.js desabilitou R por enquanto.
+// Path tracer + photon tracing.
+// Cena é carregada async via loadScene(manifestUrl) — não construída aqui.
+// BVH e arrays planos (allTris/allSphs/allLights) são reconstruídos
+// a cada loadScene.
 // ======================================================
 
 // ---------- vec3 ----------
@@ -22,341 +18,71 @@ const norm = a => {
   return [a[0]/l, a[1]/l, a[2]/l];
 };
 
-// ---------- materiais ----------
 const M_DIFFUSE = 0;
 const M_LIGHT   = 1;
-const D = albedo  => ({ kind: M_DIFFUSE, albedo });
-const L = emission => ({ kind: M_LIGHT,   emission });
-
-// (matsA/B/C removidos junto com os 3 cômodos antigos)
-
-// ---------- helpers de geometria ----------
-function pushQuad(tris, p0, p1, p2, p3, mat) {
-  const n = norm(cross(sub(p1, p0), sub(p2, p0)));
-  tris.push({ v0: p0, v1: p1, v2: p2, n, mat });
-  tris.push({ v0: p0, v1: p2, v2: p3, n, mat });
-}
 
 function albToRgb(albedo) {
   return [Math.round(albedo[0]*255), Math.round(albedo[1]*255), Math.round(albedo[2]*255)];
 }
 
-// quad axis-aligned. Empurra tris pro path tracer e quad-record pra raster.
-function addAAQuad(tris, vquads, axis, value, perpRange, yRange, mat) {
-  const [pa, pb] = perpRange;
-  const [ya, yb] = yRange;
-  let p0, p1, p2, p3;
-  if (axis === 'x') {
-    p0 = [value,ya,pa]; p1 = [value,yb,pa]; p2 = [value,yb,pb]; p3 = [value,ya,pb];
-  } else {
-    p0 = [pa,ya,value]; p1 = [pa,yb,value]; p2 = [pb,yb,value]; p3 = [pb,ya,value];
-  }
-  pushQuad(tris, p0, p1, p2, p3, mat);
-  if (vquads) vquads.push({ p0, p1, p2, p3, rgb: albToRgb(mat.albedo) });
-}
-
-// parede com (opcional) buraco de porta. door={perp:[a,b], y:[ya,yb]} ou null
-function addWall(tris, vquads, axis, value, perpRange, yRange, door, mat) {
-  if (!door) { addAAQuad(tris, vquads, axis, value, perpRange, yRange, mat); return; }
-  const [pa, pb] = perpRange;
-  const [ya, yb] = yRange;
-  const [dpa, dpb] = door.perp;
-  const [dya, dyb] = door.y;
-  if (dpa > pa) addAAQuad(tris, vquads, axis, value, [pa, dpa], [ya, yb], mat);
-  if (dpb < pb) addAAQuad(tris, vquads, axis, value, [dpb, pb], [ya, yb], mat);
-  if (dyb < yb) addAAQuad(tris, vquads, axis, value, [dpa, dpb], [dyb, yb], mat);
-  if (dya > ya) addAAQuad(tris, vquads, axis, value, [dpa, dpb], [ya, dya], mat);
-}
-
-function addBoxTris(tris, min, max, mat) {
-  const [x0,y0,z0] = min, [x1,y1,z1] = max;
-  pushQuad(tris, [x0,y0,z0],[x0,y1,z0],[x1,y1,z0],[x1,y0,z0], mat);
-  pushQuad(tris, [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1], mat);
-  pushQuad(tris, [x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1], mat);
-  pushQuad(tris, [x0,y1,z0],[x0,y1,z1],[x1,y1,z1],[x1,y1,z0], mat);
-  pushQuad(tris, [x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0], mat);
-  pushQuad(tris, [x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1], mat);
-}
-
-// ---------- definição dos cômodos ----------
-// Cada cômodo é um objeto auto-contido. tris/sphs/lights em world space.
-// bounds são pra teste "câmera está aqui?". visual.* pra raster.
-
-function buildRoom(id, min, max, doors, mats, objects, light, lightRgb) {
-  const tris = [];
-  const sphs = [];
-  const vquads = [];
-  const vboxes = [];
-  const vsphs = [];
-  // chão / teto (sem porta)
-  addAAQuad(tris, vquads, 'z', undefined, [0,0],[0,0], mats.floor); // placeholder removido abaixo
-  vquads.length = 0; tris.length = 0;
-  // chão
-  pushQuad(tris, [min[0],0,min[2]],[max[0],0,min[2]],[max[0],0,max[2]],[min[0],0,max[2]], mats.floor);
-  vquads.push({ p0:[min[0],0,min[2]], p1:[max[0],0,min[2]], p2:[max[0],0,max[2]], p3:[min[0],0,max[2]], rgb: albToRgb(mats.floor.albedo) });
-  // teto
-  pushQuad(tris, [min[0],5,min[2]],[min[0],5,max[2]],[max[0],5,max[2]],[max[0],5,min[2]], mats.ceiling);
-  vquads.push({ p0:[min[0],5,min[2]], p1:[min[0],5,max[2]], p2:[max[0],5,max[2]], p3:[max[0],5,min[2]], rgb: albToRgb(mats.ceiling.albedo) });
-  // 4 paredes
-  addWall(tris, vquads, 'x', min[0], [min[2], max[2]], [0, 5], doors.west,  mats.wall);
-  addWall(tris, vquads, 'x', max[0], [min[2], max[2]], [0, 5], doors.east,  mats.wall);
-  addWall(tris, vquads, 'z', min[2], [min[0], max[0]], [0, 5], doors.south, mats.wall);
-  addWall(tris, vquads, 'z', max[2], [min[0], max[0]], [0, 5], doors.north, mats.wall);
-  // objetos
-  for (const obj of objects) {
-    if (obj.kind === 'box') {
-      addBoxTris(tris, obj.min, obj.max, obj.mat);
-      vboxes.push({ min: obj.min.slice(), max: obj.max.slice(), rgb: albToRgb(obj.mat.albedo) });
-    } else if (obj.kind === 'sphere') {
-      sphs.push({ c: obj.c.slice(), r: obj.r, mat: obj.mat });
-      vsphs.push({ c: obj.c.slice(), r: obj.r, rgb: albToRgb(obj.mat.albedo) });
-    }
-  }
-  return {
-    id, bounds: { min, max }, tris, sphs, lights: [light],
-    visual: {
-      quads: vquads, boxes: vboxes, spheres: vsphs,
-      lights: [{ c: light.c.slice(), r: light.r, rgb: lightRgb }],
-    },
-  };
-}
-
-// ---------- helpers de cena (suportam buildGallery e futuras cenas) ----------
-function newRoom(id, min, max) {
-  return {
-    id, bounds: { min, max },
-    tris: [], sphs: [], lights: [],
-    visual: { quads: [], boxes: [], spheres: [], lights: [] },
-  };
-}
-function rmAddQuad(room, p0, p1, p2, p3, mat) {
-  pushQuad(room.tris, p0, p1, p2, p3, mat);
-  room.visual.quads.push({ p0, p1, p2, p3, rgb: albToRgb(mat.albedo) });
-}
-function rmAddBox(room, min, max, mat) {
-  addBoxTris(room.tris, min, max, mat);
-  room.visual.boxes.push({ min: min.slice(), max: max.slice(), rgb: albToRgb(mat.albedo) });
-}
-function rmAddSph(room, c, r, mat) {
-  room.sphs.push({ c, r, mat });
-  room.visual.spheres.push({ c: c.slice(), r, rgb: albToRgb(mat.albedo) });
-}
-function rmAddLight(room, c, r, emission, lightRgb) {
-  room.lights.push({ kind: 'sphere', c, r, emission });
-  room.visual.lights.push({ kind: 'sphere', c: c.slice(), r, rgb: lightRgb });
-}
-// quad light: p0,p1,p2,p3 em CCW vista do lado emissivo. Normal = cross(p1-p0, p3-p0)
-function rmAddQuadLight(room, p0, p1, p2, p3, emission, lightRgb) {
-  const u = sub(p1, p0);
-  const v = sub(p3, p0);
-  const c = cross(u, v);
-  const area = Math.hypot(c[0], c[1], c[2]);
-  const n = [c[0]/area, c[1]/area, c[2]/area];
-  room.lights.push({ kind: 'quad', p0, p1, p2, p3, n, area, emission });
-  room.visual.lights.push({ kind: 'quad', p0, p1, p2, p3, rgb: lightRgb });
-}
-
-// ---------- cena: galeria de museu (~1000 tris) ----------
-function buildGallery() {
-  // Sala 8m × 5m × 16m (z é comprimento)
-  const room = newRoom('Gallery', [-4, 0, -8], [4, 5, 8]);
-
-  // === paleta ===
-  const matFloor1   = D([0.50, 0.36, 0.22]);
-  const matFloor2   = D([0.58, 0.42, 0.28]);
-  const matCeil     = D([0.92, 0.92, 0.86]);
-  const matWall     = D([0.45, 0.10, 0.13]); // crimson
-  const matWainscot = D([0.92, 0.88, 0.78]);
-  const matFrameG   = D([0.78, 0.62, 0.25]); // ouro
-  const matCanvas1  = D([0.30, 0.22, 0.16]);
-  const matCanvas2  = D([0.55, 0.42, 0.30]);
-  const matCanvas3  = D([0.45, 0.45, 0.50]);
-  const matCanvas4  = D([0.65, 0.55, 0.45]);
-  const matCanvas5  = D([0.40, 0.30, 0.25]);
-  const matBench    = D([0.22, 0.13, 0.08]);
-  const matTable    = D([0.28, 0.18, 0.10]);
-  const matAltar    = D([0.92, 0.90, 0.85]);
-  const matCrucifix = D([0.62, 0.50, 0.22]);
-  const matStatue   = D([0.28, 0.22, 0.14]);
-  const matTrim     = D([0.85, 0.83, 0.75]);
-
-  // === chão parquet (1m × 2m, 8×8 = 64 placas, alternando 2 tons) ===
-  for (let zi = 0; zi < 8; zi++) {
-    for (let xi = 0; xi < 8; xi++) {
-      const x0 = -4 + xi, x1 = x0 + 1;
-      const z0 = -8 + zi*2, z1 = z0 + 2;
-      const m = ((xi + zi) & 1) ? matFloor1 : matFloor2;
-      rmAddQuad(room, [x0, 0, z0], [x1, 0, z0], [x1, 0, z1], [x0, 0, z1], m);
-    }
-  }
-
-  // === teto (4×8 panels com leve variação pra coffer feel) ===
-  for (let zi = 0; zi < 8; zi++) {
-    for (let xi = 0; xi < 4; xi++) {
-      const x0 = -4 + xi*2, x1 = x0 + 2;
-      const z0 = -8 + zi*2, z1 = z0 + 2;
-      rmAddQuad(room, [x0, 5, z0], [x0, 5, z1], [x1, 5, z1], [x1, 5, z0], matCeil);
-    }
-  }
-
-  // === paredes laterais (split em wainscoting + parte vermelha) ===
-  // West (x=-4)
-  rmAddQuad(room, [-4, 0, -8], [-4, 1, -8], [-4, 1, 8], [-4, 0, 8], matWainscot);
-  rmAddQuad(room, [-4, 1, -8], [-4, 5, -8], [-4, 5, 8], [-4, 1, 8], matWall);
-  // East (x=+4)
-  rmAddQuad(room, [4, 0, -8], [4, 0, 8], [4, 1, 8], [4, 1, -8], matWainscot);
-  rmAddQuad(room, [4, 1, -8], [4, 1, 8], [4, 5, 8], [4, 5, -8], matWall);
-  // South (z=+8) - entrada
-  rmAddQuad(room, [-4, 0, 8], [4, 0, 8], [4, 1, 8], [-4, 1, 8], matWainscot);
-  rmAddQuad(room, [-4, 1, 8], [4, 1, 8], [4, 5, 8], [-4, 5, 8], matWall);
-
-  // === parede de fundo (z=-8) com alcova ===
-  // wainscot full
-  rmAddQuad(room, [-4, 0, -8], [4, 0, -8], [4, 1, -8], [-4, 1, -8], matWainscot);
-  // upper wall: 3 tiras em volta do buraco da alcova (x ∈ [-1.2, 1.2], y ∈ [1, 4])
-  rmAddQuad(room, [-4, 1, -8], [-1.2, 1, -8], [-1.2, 5, -8], [-4, 5, -8], matWall);
-  rmAddQuad(room, [1.2, 1, -8], [4, 1, -8], [4, 5, -8], [1.2, 5, -8], matWall);
-  rmAddQuad(room, [-1.2, 4, -8], [1.2, 4, -8], [1.2, 5, -8], [-1.2, 5, -8], matWall);
-  // alcova interior (recesso até z=-9)
-  rmAddQuad(room, [-1.2, 1, -9], [1.2, 1, -9], [1.2, 4, -9], [-1.2, 4, -9], matAltar); // back
-  rmAddQuad(room, [-1.2, 1, -9], [-1.2, 4, -9], [-1.2, 4, -8], [-1.2, 1, -8], matAltar); // left
-  rmAddQuad(room, [1.2, 1, -8], [1.2, 4, -8], [1.2, 4, -9], [1.2, 1, -9], matAltar);     // right
-  rmAddQuad(room, [-1.2, 4, -9], [-1.2, 4, -8], [1.2, 4, -8], [1.2, 4, -9], matAltar);   // top
-  rmAddQuad(room, [-1.2, 1, -9], [-1.2, 1, -8], [1.2, 1, -8], [1.2, 1, -9], matAltar);   // bottom
-
-  // === itens da alcova ===
-  rmAddBox(room, [-1.0, 1.0, -8.9], [1.0, 1.4, -8.3], matAltar);                  // altar block
-  rmAddBox(room, [-0.05, 1.4, -8.85], [0.05, 3.0, -8.75], matCrucifix);          // crucifix vertical
-  rmAddBox(room, [-0.4, 2.4, -8.85], [0.4, 2.55, -8.75], matCrucifix);            // cross arm
-  rmAddBox(room, [-0.85, 1.4, -8.85], [-0.65, 1.7, -8.7], matAltar);              // statue base L
-  rmAddBox(room, [0.65, 1.4, -8.85], [0.85, 1.7, -8.7], matAltar);                // statue base R
-  rmAddBox(room, [-0.82, 1.7, -8.83], [-0.68, 2.5, -8.72], matStatue);            // statue L
-  rmAddBox(room, [0.68, 1.7, -8.83], [0.82, 2.5, -8.72], matStatue);              // statue R
-  rmAddBox(room, [-0.30, 1.4, -8.85], [-0.20, 1.6, -8.75], matCrucifix);          // candle L
-  rmAddBox(room, [0.20, 1.4, -8.85], [0.30, 1.6, -8.75], matCrucifix);            // candle R
-
-  // === pilastras (4 por parede lateral, no z = -6, -2, 2, 6) ===
-  for (const z of [-6, -2, 2, 6]) {
-    rmAddBox(room, [-4.0, 0, z - 0.15], [-3.85, 4.5, z + 0.15], matWainscot);
-    rmAddBox(room, [3.85, 0, z - 0.15], [4.0, 4.5, z + 0.15], matWainscot);
-  }
-
-  // === quadros nas paredes laterais ===
-  // West (5 quadros nos 5 vãos entre pilastras)
-  const westPaintings = [
-    { z: -7, w: 1.4, h: 1.6, m: matCanvas1 },
-    { z: -4, w: 2.0, h: 2.2, m: matCanvas2 },
-    { z:  0, w: 1.8, h: 2.0, m: matCanvas3 },
-    { z:  4, w: 1.5, h: 1.8, m: matCanvas4 },
-    { z:  7, w: 1.4, h: 1.6, m: matCanvas5 },
-  ];
-  for (const p of westPaintings) {
-    const yc = 2.6, hw = p.w * 0.5, hh = p.h * 0.5;
-    rmAddBox(room, [-3.95, yc - hh, p.z - hw], [-3.85, yc + hh, p.z + hw], matFrameG);
-    rmAddBox(room, [-3.91, yc - hh + 0.12, p.z - hw + 0.12],
-                   [-3.83, yc + hh - 0.12, p.z + hw - 0.12], p.m);
-  }
-  // East (5 quadros)
-  const eastPaintings = [
-    { z: -7, w: 1.4, h: 1.6, m: matCanvas2 },
-    { z: -4, w: 1.6, h: 1.9, m: matCanvas3 },
-    { z:  0, w: 1.8, h: 2.0, m: matCanvas4 },
-    { z:  4, w: 2.0, h: 2.2, m: matCanvas5 },
-    { z:  7, w: 1.5, h: 1.7, m: matCanvas1 },
-  ];
-  for (const p of eastPaintings) {
-    const yc = 2.6, hw = p.w * 0.5, hh = p.h * 0.5;
-    rmAddBox(room, [3.85, yc - hh, p.z - hw], [3.95, yc + hh, p.z + hw], matFrameG);
-    rmAddBox(room, [3.83, yc - hh + 0.12, p.z - hw + 0.12],
-                   [3.91, yc + hh - 0.12, p.z + hw - 0.12], p.m);
-  }
-
-  // === bancos (2: centro + sul) ===
-  for (const bz of [0, 5]) {
-    rmAddBox(room, [-0.75, 0.4, bz - 0.3], [0.75, 0.45, bz + 0.3], matBench);
-    rmAddBox(room, [-0.7, 0, bz - 0.25], [-0.6, 0.4, bz - 0.15], matBench);
-    rmAddBox(room, [0.6, 0, bz - 0.25], [0.7, 0.4, bz - 0.15], matBench);
-    rmAddBox(room, [-0.7, 0, bz + 0.15], [-0.6, 0.4, bz + 0.25], matBench);
-    rmAddBox(room, [0.6, 0, bz + 0.15], [0.7, 0.4, bz + 0.25], matBench);
-  }
-
-  // === mesa pequena no canto sudoeste ===
-  rmAddBox(room, [-3.5, 0.55, 5.4], [-2.5, 0.6, 6.1], matTable);
-  rmAddBox(room, [-3.45, 0, 5.45], [-3.35, 0.55, 5.55], matTable);
-  rmAddBox(room, [-2.65, 0, 5.45], [-2.55, 0.55, 5.55], matTable);
-  rmAddBox(room, [-3.45, 0, 5.95], [-3.35, 0.55, 6.05], matTable);
-  rmAddBox(room, [-2.65, 0, 5.95], [-2.55, 0.55, 6.05], matTable);
-
-  // === trim ===
-  // chair rail at y=1.0 (decorativo, fino)
-  rmAddBox(room, [-4.0, 0.95, -8], [-3.95, 1.05, 8], matTrim);
-  rmAddBox(room, [3.95, 0.95, -8], [4.0, 1.05, 8], matTrim);
-  rmAddBox(room, [-4, 0.95, -8], [4, 1.05, -7.95], matTrim);
-  rmAddBox(room, [-4, 0.95, 7.95], [4, 1.05, 8], matTrim);
-  // cornija/cove shelf: 0.3m wide, projeta da parede e ESCONDE as cove lights abaixo
-  rmAddBox(room, [-4.0, 4.5, -8], [-3.7, 4.7, 8], matTrim);     // west cornice
-  rmAddBox(room, [3.7, 4.5, -8], [4.0, 4.7, 8], matTrim);       // east cornice
-  rmAddBox(room, [-4, 4.5, -8], [4, 4.7, -7.7], matTrim);       // north cornice
-  rmAddBox(room, [-4, 4.5, 7.7], [4, 4.7, 8], matTrim);         // south cornice
-
-  // === luzes ===
-  // Cove lights: planares ao longo do topo das paredes laterais, em cima
-  // da cornija, apontando UP. Escondidas da visão direta da galeria — só
-  // o teto recebe luz direta, e ele reflete difusa pra todo lugar.
-  rmAddQuadLight(room,
-    [-3.7, 4.85, -7.5], [-3.95, 4.85, -7.5],
-    [-3.95, 4.85,  7.5], [-3.7, 4.85,  7.5],
-    [22, 18, 12], [255, 230, 180],
-  );
-  rmAddQuadLight(room,
-    [3.95, 4.85, -7.5], [3.7, 4.85, -7.5],
-    [3.7, 4.85,  7.5], [3.95, 4.85,  7.5],
-    [22, 18, 12], [255, 230, 180],
-  );
-  // Luz hidden na alcova (atrás do altar, ilumina crucifixo+estátuas de
-  // baixo pra cima). Visível só de dentro da alcova.
-  rmAddQuadLight(room,
-    [ 0.9, 1.41, -8.7], [-0.9, 1.41, -8.7],
-    [-0.9, 1.41, -8.4], [ 0.9, 1.41, -8.4],
-    [38, 28, 16], [255, 220, 150],
-  );
-
-  return room;
-}
-
-export const rooms = [buildGallery()];
-
-// arrays planos com tudo de todos os cômodos. Usados nos intersects pra
-// permitir fótons atravessarem portas. Cômodos longe são naturalmente
-// fog-culled durante a projeção.
+// ---------- estado (mutável; populado por loadScene) ----------
+export const rooms = [];
+let activeRoom = null;
+let manifestData = null;
 const allTris = [];
 const allSphs = [];
 const allLights = [];
-for (const r of rooms) {
-  for (const t of r.tris)   allTris.push(t);
-  for (const s of r.sphs)   allSphs.push(s);
-  for (const l of r.lights) allLights.push(l);
+
+// ---------- scene loader ----------
+export async function loadScene(manifestUrl) {
+  const res = await fetch(manifestUrl);
+  if (!res.ok) throw new Error(`loadScene: ${manifestUrl} → ${res.status}`);
+  manifestData = await res.json();
+  const baseUrl = manifestUrl.substring(0, manifestUrl.lastIndexOf('/') + 1);
+
+  rooms.length = 0;
+  allTris.length = 0;
+  allSphs.length = 0;
+  allLights.length = 0;
+
+  const loaded = await Promise.all(manifestData.rooms.map(async (meta) => {
+    const r = await fetch(baseUrl + meta.file);
+    if (!r.ok) throw new Error(`loadScene: ${meta.file} → ${r.status}`);
+    return r.json();
+  }));
+  for (const room of loaded) {
+    rooms.push(room);
+    for (const t of room.tris)   allTris.push(t);
+    for (const s of room.sphs)   allSphs.push(s);
+    for (const l of room.lights) allLights.push(l);
+  }
+  rebuildBVH();
+  activeRoom = rooms[0] || null;
+  return manifestData;
 }
+
+export function getManifest() { return manifestData; }
+export function getPortals()  { return manifestData?.portals || []; }
 
 // ---------- objetos animados ----------
 // Listas separadas (não entram no BVH). Intersect brute force, são poucos.
 // Posições são atualizadas em tickAnimation(t) toda frame.
-const dynamicSphs = [];      // esferas difusas animadas
-const dynamicEntries = [];   // {update: t => void}
-const dynamicVisual = [];    // pra raster overlay: {kind, c, r, rgb}
+const dynamicSphs = [];
+const dynamicEntries = [];
+const dynamicVisual = [];
 
-function addAnimatedSphere(initC, r, mat, animFn) {
+export function addAnimatedSphere(initC, r, albedo, animFn) {
   const c = initC.slice();
-  const item = { c, r, mat };
+  const item = { c, r, mat: { kind: M_DIFFUSE, albedo } };
   dynamicSphs.push(item);
-  dynamicVisual.push({ kind: 'sphere', c, r, rgb: albToRgb(mat.albedo) });
+  dynamicVisual.push({ kind: 'sphere', c, r, rgb: albToRgb(albedo) });
   dynamicEntries.push({ update(t) {
     const nc = animFn(t);
     c[0] = nc[0]; c[1] = nc[1]; c[2] = nc[2];
   }});
 }
 
-function addAnimatedLight(initC, r, emission, lightRgb, animFn) {
+export function addAnimatedLight(initC, r, emission, lightRgb, animFn) {
   const c = initC.slice();
   const lt = { kind: 'sphere', c, r, emission };
   allLights.push(lt);
@@ -368,17 +94,6 @@ function addAnimatedLight(initC, r, emission, lightRgb, animFn) {
   return lt;
 }
 
-addAnimatedSphere(
-  [-2, 0.5, -5], 0.4,
-  D([0.95, 0.50, 0.18]),
-  t => [-2, 0.5 + Math.abs(Math.sin(t * 1.6)) * 1.6, -5],
-);
-addAnimatedLight(
-  [1.8, 3.0, 0], 0.16,
-  [10, 18, 30], [160, 200, 255],
-  t => [1.8 * Math.cos(t * 0.6), 3.0, 1.8 * Math.sin(t * 0.6)],
-);
-
 export function tickAnimation(t) {
   for (const e of dynamicEntries) e.update(t);
 }
@@ -387,16 +102,13 @@ export function getDynamicVisuals() {
 }
 
 // ---------- BVH (median-split, leaf size 4) ----------
-// Acelera intersect de O(N) pra ~O(log N). Construído uma vez no load.
-// Toggle exposto pra comparar performance brute vs BVH.
 let useBVH = true;
+let bvhRoot = null;
 export function setUseBVH(v) { useBVH = !!v; }
 export function getBVHStats() {
   return { items: allTris.length + allSphs.length };
 }
 
-// contadores pra verificar BVH vs brute. Reset/get expostos pro main.js
-// chamar uma vez por frame (depois da geração de fótons).
 let countPrim = 0, countAABB = 0;
 export function resetIntersectCounters() { countPrim = 0; countAABB = 0; }
 export function getIntersectCounters() { return { prim: countPrim, aabb: countAABB }; }
@@ -461,13 +173,14 @@ function buildBVH(items) {
   return build([...items]);
 }
 
-const bvhItems = [
-  ...allTris.map(t => ({ kind: 0, data: t, bounds: triBounds(t) })),
-  ...allSphs.map(s => ({ kind: 1, data: s, bounds: sphBounds(s) })),
-];
-const bvhRoot = buildBVH(bvhItems);
+function rebuildBVH() {
+  const items = [
+    ...allTris.map(t => ({ kind: 0, data: t, bounds: triBounds(t) })),
+    ...allSphs.map(s => ({ kind: 1, data: s, bounds: sphBounds(s) })),
+  ];
+  bvhRoot = items.length > 0 ? buildBVH(items) : null;
+}
 
-// Ray-AABB slab. Retorna true se intersecta E está mais perto que tMaxLimit.
 function intersectAABB(boxMin, boxMax, ro, invDx, invDy, invDz, tMaxLimit) {
   countAABB++;
   let t1 = (boxMin[0] - ro[0]) * invDx;
@@ -484,7 +197,6 @@ function intersectAABB(boxMin, boxMax, ro, invDx, invDy, invDz, tMaxLimit) {
   return tmax >= Math.max(0, tmin) && tmin < tMaxLimit;
 }
 
-// Closest hit: atualiza hit em-place
 function bvhClosest(node, ro, rd, invDx, invDy, invDz, hit) {
   if (!intersectAABB(node.boundsMin, node.boundsMax, ro, invDx, invDy, invDz, hit.t)) return;
   if (node.leaf) {
@@ -509,7 +221,6 @@ function bvhClosest(node, ro, rd, invDx, invDy, invDz, hit) {
   bvhClosest(node.right, ro, rd, invDx, invDy, invDz, hit);
 }
 
-// Any hit (early exit) pra shadow rays
 function bvhAnyHit(node, ro, rd, invDx, invDy, invDz, maxT) {
   if (!intersectAABB(node.boundsMin, node.boundsMax, ro, invDx, invDy, invDz, maxT)) return false;
   if (node.leaf) {
@@ -526,10 +237,9 @@ function bvhAnyHit(node, ro, rd, invDx, invDy, invDz, maxT) {
   return false;
 }
 
-// ---------- active room (só pra HUD/info, não pra culling) ----------
-let activeRoom = rooms[0];
-
+// ---------- active room (só pra HUD/info) ----------
 export function setActiveRoomByPos(pos) {
+  if (!rooms.length) return null;
   for (const r of rooms) {
     const { min, max } = r.bounds;
     if (pos[0] >= min[0] && pos[0] <= max[0] &&
@@ -539,12 +249,12 @@ export function setActiveRoomByPos(pos) {
       return r.id;
     }
   }
-  return activeRoom.id;
+  return activeRoom?.id ?? null;
 }
 
-export function getActiveRoomId() { return activeRoom.id; }
+export function getActiveRoomId() { return activeRoom?.id ?? null; }
 
-// ---------- interseção (apenas no cômodo ativo) ----------
+// ---------- interseção ----------
 function intersectTri(tri, ro, rd) {
   countPrim++;
   const v0 = tri.v0;
@@ -583,7 +293,7 @@ function intersectSphere(s, ro, rd) {
 
 function intersectScene(ro, rd) {
   const hit = { t: Infinity, mat: null, n: null };
-  if (useBVH) {
+  if (useBVH && bvhRoot) {
     bvhClosest(bvhRoot, ro, rd, 1/rd[0], 1/rd[1], 1/rd[2], hit);
   } else {
     for (let i = 0; i < allTris.length; i++) {
@@ -601,7 +311,6 @@ function intersectScene(ro, rd) {
       }
     }
   }
-  // dynamic spheres (não estão no BVH; brute force, poucas)
   for (let i = 0; i < dynamicSphs.length; i++) {
     const s = dynamicSphs[i];
     const t = intersectSphere(s, ro, rd);
@@ -612,7 +321,6 @@ function intersectScene(ro, rd) {
       hit.n = norm([px - s.c[0], py - s.c[1], pz - s.c[2]]);
     }
   }
-  // luzes ficam fora do BVH (poucas, brute é igual). Dispatch por kind.
   for (let i = 0; i < allLights.length; i++) {
     const lt = allLights[i];
     let t;
@@ -638,7 +346,7 @@ function intersectScene(ro, rd) {
 }
 
 function occluded(ro, rd, maxT) {
-  if (useBVH) {
+  if (useBVH && bvhRoot) {
     if (bvhAnyHit(bvhRoot, ro, rd, 1/rd[0], 1/rd[1], 1/rd[2], maxT)) return true;
   } else {
     for (let i = 0; i < allTris.length; i++) {
@@ -648,7 +356,6 @@ function occluded(ro, rd, maxT) {
       if (intersectSphere(allSphs[i], ro, rd) < maxT) return true;
     }
   }
-  // dynamic sempre brute force
   for (let i = 0; i < dynamicSphs.length; i++) {
     if (intersectSphere(dynamicSphs[i], ro, rd) < maxT) return true;
   }
@@ -676,9 +383,8 @@ function sampleCosineHemisphere(n) {
 }
 
 // ---------- direct lighting (NEE) ----------
-// Sample uniforme entre todas as luzes (1/N pdf, factor *= N pra compensar).
-// Dispatch por kind: sphere = uniform em superfície; quad = uniform em área.
 function directLight(p, n, albedo) {
+  if (!allLights.length) return [0,0,0];
   const lt = allLights[(Math.random() * allLights.length) | 0];
   let lpx, lpy, lpz, lightArea, lnx, lny, lnz;
   if (lt.kind === 'quad') {
@@ -716,7 +422,7 @@ function directLight(p, n, albedo) {
   ];
 }
 
-// ---------- path tracer (mantido mas main.js desabilitou R) ----------
+// ---------- path tracer ----------
 const MAX_DEPTH = 6;
 function trace(ro, rd, depth, includeEmission) {
   if (depth >= MAX_DEPTH) return [0,0,0];
@@ -817,17 +523,11 @@ function ptDisplay() {
 }
 
 // ---------- traçar caminho de fóton (lighttrace) ----------
-// Retorna { points, colors, intensities }:
-//   colors[i]      = cor do material no ponto i (0 = luz)
-//   intensities[i] = energia restante deixando o ponto i.
-//                    Inicial = 1 + (rand*2-1)*emissionVar (clamp >= 0)
-//                    Se applyDecay, multiplica por mean(albedo) a cada bounce.
 export function tracePhotonPath(maxBounces = 4, emissionVar = 0, applyDecay = false) {
   const points = [];
   const colors = [];
   const intensities = [];
-  // sorteia uma luz uniformemente. Sphere → uniform em superfície,
-  // quad → uniform em área. Direção sempre cosine-weighted da normal.
+  if (!allLights.length) return { points, colors, intensities };
   const lt = allLights[(Math.random() * allLights.length) | 0];
   const me = Math.max(lt.emission[0], lt.emission[1], lt.emission[2]);
   const lightColor = [lt.emission[0]/me, lt.emission[1]/me, lt.emission[2]/me];

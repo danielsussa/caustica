@@ -1,3 +1,10 @@
+import {
+  loadScene, tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
+  resetIntersectCounters, getIntersectCounters,
+  addAnimatedSphere, addAnimatedLight, tickAnimation,
+  startPathTracer, stopPathTracer, setPathTracerCamera,
+} from './raytrace.js';
+
 const canvas = document.getElementById('screen');
 const ctx = canvas.getContext('2d');
 const modeLabel = document.getElementById('mode-label');
@@ -169,34 +176,38 @@ function quadEntry(q) {
 
 // monta a cena raster a partir de todos os cômodos. Cada entry é taggeada
 // com roomId (filtragem) e kind + dados raw (silhouette mode usa).
+// scene é populada por buildVisualScene() depois do loadScene.
 const scene = [];
-for (const room of rooms) {
-  const rid = room.id;
-  for (const q of room.visual.quads) {
-    scene.push({ ...quadEntry(q), roomId: rid, kind: 'quad' });
-  }
-  for (const b of room.visual.boxes) {
-    scene.push({
-      ...boxGeom(b.min, b.max), rgb: b.rgb, roomId: rid,
-      kind: 'box', boxMin: b.min, boxMax: b.max,
-    });
-  }
-  for (const s of room.visual.spheres) {
-    scene.push({
-      ...sphereGeom(s.c, s.r, 12, 16), rgb: s.rgb, roomId: rid,
-      kind: 'sphere', sphCenter: s.c, sphRadius: s.r,
-    });
-  }
-  for (const l of room.visual.lights) {
-    if (l.kind === 'quad') {
+function buildVisualScene() {
+  scene.length = 0;
+  for (const room of rooms) {
+    const rid = room.id;
+    for (const q of room.visual.quads) {
+      scene.push({ ...quadEntry(q), roomId: rid, kind: 'quad' });
+    }
+    for (const b of room.visual.boxes) {
       scene.push({
-        ...quadEntry(l), rgb: l.rgb, emissive: true, roomId: rid, kind: 'quad',
+        ...boxGeom(b.min, b.max), rgb: b.rgb, roomId: rid,
+        kind: 'box', boxMin: b.min, boxMax: b.max,
       });
-    } else {
+    }
+    for (const s of room.visual.spheres) {
       scene.push({
-        ...sphereGeom(l.c, l.r, 10, 14), rgb: l.rgb, emissive: true, roomId: rid,
-        kind: 'sphere', sphCenter: l.c, sphRadius: l.r,
+        ...sphereGeom(s.c, s.r, 12, 16), rgb: s.rgb, roomId: rid,
+        kind: 'sphere', sphCenter: s.c, sphRadius: s.r,
       });
+    }
+    for (const l of room.visual.lights) {
+      if (l.kind === 'quad') {
+        scene.push({
+          ...quadEntry(l), rgb: l.rgb, emissive: true, roomId: rid, kind: 'quad',
+        });
+      } else {
+        scene.push({
+          ...sphereGeom(l.c, l.r, 10, 14), rgb: l.rgb, emissive: true, roomId: rid,
+          kind: 'sphere', sphCenter: l.c, sphRadius: l.r,
+        });
+      }
     }
   }
 }
@@ -737,13 +748,6 @@ function drawShaded(view) {
 }
 
 // ---------- estado / interação ----------
-import {
-  tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
-  resetIntersectCounters, getIntersectCounters,
-  tickAnimation,
-  startPathTracer, stopPathTracer, setPathTracerCamera,
-} from './raytrace.js';
-
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
 let prevRasterMode = 'wireframe';
 // câmera livre: posição em world space + euler angles
@@ -1099,7 +1103,25 @@ function frame() {
 
   rafId = requestAnimationFrame(frame);
 }
-frame();
+
+async function init() {
+  await loadScene(`${import.meta.env.BASE_URL}scenes/gallery/manifest.json`);
+  buildVisualScene();
+  // objetos animados específicos da galeria — vivem fora do JSON da cena
+  // por enquanto (parametricos, não data-only).
+  addAnimatedSphere(
+    [-2, 0.5, -5], 0.4,
+    [0.95, 0.50, 0.18],
+    t => [-2, 0.5 + Math.abs(Math.sin(t * 1.6)) * 1.6, -5],
+  );
+  addAnimatedLight(
+    [1.8, 3.0, 0], 0.16,
+    [10, 18, 30], [160, 200, 255],
+    t => [1.8 * Math.cos(t * 0.6), 3.0, 1.8 * Math.sin(t * 0.6)],
+  );
+  frame();
+}
+init();
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => cancelAnimationFrame(rafId));

@@ -4,6 +4,9 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
+    "build:scenes": "node scripts/build-scenes.js",
+    "predev": "npm run build:scenes",
+    "prebuild": "npm run build:scenes",
     "dev": "vite --port 5199 --strictPort",
     "build": "vite build",
     "preview": "vite preview"
