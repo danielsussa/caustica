@@ -763,7 +763,7 @@ function drawShaded(view) {
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
 let prevRasterMode = 'wireframe';
 // câmera livre: posição em world space + euler angles
-let camPos = [0, 1.7, -3];   // dentro da Field Marshals' Hall, olhando pra enfilade
+let camPos = [0, 1.7, 0];    // centro da cena vazia
 let yaw = 0, pitch = 0;
 let lastFrameTime = 0;
 const keys = Object.create(null);
@@ -1309,8 +1309,8 @@ function frame() {
 }
 
 async function init() {
-  // ?scene=gallery troca cena por query param; default = hermitage-enfilade
-  const sceneId = new URLSearchParams(location.search).get('scene') || 'hermitage-enfilade';
+  // ?scene=<id> troca cena. default = empty (sandbox); outras: hermitage-enfilade, gallery
+  const sceneId = new URLSearchParams(location.search).get('scene') || 'empty';
   await loadScene(`${import.meta.env.BASE_URL}scenes/${sceneId}/manifest.json`);
   buildVisualScene();
   sceneOriginalLength = scene.length;
