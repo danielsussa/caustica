@@ -949,6 +949,7 @@ let lastPTCamHash = null;
 function syncLightTracePanel() {
   if (!ltPanel) return;
   ltPanel.classList.toggle('open', mode === 'lighttrace');
+  document.getElementById('btn-params')?.classList.toggle('visible', mode === 'lighttrace');
 }
 
 // ---------- transição path tracer ----------
@@ -1015,6 +1016,16 @@ if (btnLEl) {
   btnLEl.addEventListener('click', toggleLightTrace);
   // touchstart com preventDefault evita o duplo-fire (touch + click sintético)
   btnLEl.addEventListener('touchstart', e => { e.preventDefault(); toggleLightTrace(); }, { passive: false });
+}
+
+const btnParamsEl = document.getElementById('btn-params');
+function toggleParamsPanel() {
+  if (!ltPanel || mode !== 'lighttrace') return;
+  ltPanel.classList.toggle('open');
+}
+if (btnParamsEl) {
+  btnParamsEl.addEventListener('click', toggleParamsPanel);
+  btnParamsEl.addEventListener('touchstart', e => { e.preventDefault(); toggleParamsPanel(); }, { passive: false });
 }
 
 // ---------- bind dos sliders ----------
