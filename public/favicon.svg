@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="5" fill="#0a0a0a"/>
+  <!-- halo da fonte -->
+  <circle cx="16" cy="9" r="4.5" fill="#ffd87a" opacity="0.22"/>
+  <!-- fonte de luz -->
+  <circle cx="16" cy="9" r="1.9" fill="#fff5d6"/>
+  <!-- glow do arco cáustico -->
+  <path d="M 5 23 Q 16 14 27 23" stroke="#ffd87a" stroke-width="4.5" fill="none" stroke-linecap="round" opacity="0.18"/>
+  <!-- arco cáustico -->
+  <path d="M 5 23 Q 16 14 27 23" stroke="#ffd87a" stroke-width="2" fill="none" stroke-linecap="round"/>
+</svg>

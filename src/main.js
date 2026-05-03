@@ -318,18 +318,18 @@ let photonCount = 0;
 
 // parâmetros ajustáveis via sliders / toggles
 let ltPathsPerFrame = 40;
-let ltAlphaBase     = 0.05;
-let ltAlphaDecay    = 0.45;
+let ltAlphaBase     = 0.08;
+let ltAlphaDecay    = 0.6;
 let ltMaxBounces    = 4;
 let ltShowWireframe = false;
 let ltSplats        = true;
 let ltFog           = true;
-let ltColorByBounce = false;
+let ltColorByBounce = true;
 let ltLineFirstOnly = false;
 let ltGaussian      = false;
 let contourPower = 0; // 0..1, controlado dinamicamente
-let ltPhysicalDecay = false;
-let ltEmissionVar   = 0;     // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
+let ltPhysicalDecay = true;
+let ltEmissionVar   = 0.7;   // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
 const FOG_STRENGTH        = 0.06;
 const N_FOG_BUCKETS       = 4;
 const N_INTENSITY_BUCKETS = 8;
