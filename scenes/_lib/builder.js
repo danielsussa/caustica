@@ -65,6 +65,35 @@ export function rmAddLight(room, c, r, emission, lightRgb) {
   room.visual.lights.push({ kind: 'sphere', c: c.slice(), r, rgb: lightRgb });
 }
 
+// parede axis-aligned com (opcional) buraco de porta retangular.
+// axis: 'x' ou 'z' (eixo perpendicular à parede)
+// value: posição da parede no eixo perp
+// perpRange: [a, b] no eixo horizontal restante
+// yRange:    [ya, yb] vertical
+// door:      { perp: [a, b], y: [ya, yb] } ou null
+export function rmAddWall(room, axis, value, perpRange, yRange, door, mat) {
+  const [pa, pb] = perpRange;
+  const [ya, yb] = yRange;
+  const quad = (qpa, qpb, qya, qyb) => {
+    let p0, p1, p2, p3;
+    if (axis === 'x') {
+      p0 = [value, qya, qpa]; p1 = [value, qyb, qpa];
+      p2 = [value, qyb, qpb]; p3 = [value, qya, qpb];
+    } else {
+      p0 = [qpa, qya, value]; p1 = [qpa, qyb, value];
+      p2 = [qpb, qyb, value]; p3 = [qpb, qya, value];
+    }
+    rmAddQuad(room, p0, p1, p2, p3, mat);
+  };
+  if (!door) { quad(pa, pb, ya, yb); return; }
+  const [dpa, dpb] = door.perp;
+  const [dya, dyb] = door.y;
+  if (dpa > pa) quad(pa, dpa, ya, yb);            // tira esquerda
+  if (dpb < pb) quad(dpb, pb, ya, yb);            // tira direita
+  if (dyb < yb) quad(dpa, dpb, dyb, yb);          // tira em cima da porta
+  if (dya > ya) quad(dpa, dpb, ya, dya);          // tira em baixo
+}
+
 // quad light: p0..p3 em CCW vista do lado emissivo. Normal = cross(p1-p0, p3-p0)
 export function rmAddQuadLight(room, p0, p1, p2, p3, emission, lightRgb) {
   const u = sub(p1, p0);

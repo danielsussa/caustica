@@ -1,7 +1,7 @@
 import {
   loadScene, tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
   resetIntersectCounters, getIntersectCounters,
-  addAnimatedSphere, addAnimatedLight, tickAnimation,
+  tickAnimation,
   startPathTracer, stopPathTracer, setPathTracerCamera,
 } from './raytrace.js';
 
@@ -313,6 +313,10 @@ const photonXYZ       = new Float32Array(MAX_PATHS * MAX_POINTS * 3);
 const photonRGB       = new Float32Array(MAX_PATHS * MAX_POINTS * 3); // cor 0-1 por ponto
 const photonIntensity = new Float32Array(MAX_PATHS * MAX_POINTS);     // energia carregada
 const photonLen       = new Uint8Array(MAX_PATHS);
+// staggered reveal: idade em frames (do append) e quantos splats já foram
+// pintados pra esse slot. revealedSegs = floor(age/framesPerBounce) + 1
+const photonAge        = new Uint16Array(MAX_PATHS);
+const photonSplatStage = new Uint8Array(MAX_PATHS);
 let photonHead = 0;
 let photonCount = 0;
 
@@ -327,6 +331,7 @@ let ltFog           = true;
 let ltColorByBounce = true;
 let ltLineFirstOnly = false;
 let ltGaussian      = false;
+let ltFramesPerBounce = 1; // 1 = instant, N = cada bounce demora N frames pra aparecer
 let contourPower = 0; // 0..1, controlado dinamicamente
 let ltPhysicalDecay = true;
 let ltEmissionVar   = 0.7;   // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
@@ -350,6 +355,8 @@ function appendPhotonPath(pts, cols, intensities) {
     photonIntensity[ibase + i] = intensities[i];
   }
   photonLen[slot] = n;
+  photonAge[slot] = 0;
+  photonSplatStage[slot] = 0;
   photonHead = (photonHead + 1) % MAX_PATHS;
   if (photonCount < MAX_PATHS) photonCount++;
 }
@@ -370,7 +377,6 @@ const segmentBuckets = new Map();
 const splatLayer = document.createElement('canvas');
 let splatLayerCtx = null;
 let splatLayerW = 0, splatLayerH = 0;
-let splatHeadAtLastDraw = 0;
 let splatLastEnabled = false;
 let splatLastViewKey = null;
 let splatFadeTimer = 0; // segundos restantes de fade ativo
@@ -381,7 +387,6 @@ function ensureSplatLayer() {
     splatLayer.height = H;
     splatLayerCtx = splatLayer.getContext('2d');
     splatLayerW = W; splatLayerH = H;
-    splatHeadAtLastDraw = 0;
     splatLastViewKey = null;
   }
 }
@@ -390,35 +395,25 @@ function getSplatViewKey() {
   return `${camPos[0].toFixed(2)}|${camPos[1].toFixed(2)}|${camPos[2].toFixed(2)}|${yaw.toFixed(3)}|${pitch.toFixed(3)}|${W}|${H}`;
 }
 
-function drawSplatsToLayer(startSlot, count, useIntensity) {
-  splatLayerCtx.globalCompositeOperation = 'lighter';
-  const splatBaseAlpha = 0.12;
-  for (let i = 0; i < count; i++) {
-    const slot = (startSlot + i) % MAX_PATHS;
-    const slotBase = slot * MAX_POINTS;
-    const len = photonLen[slot];
-    for (let pi = 1; pi < len; pi++) {
-      const idx = slotBase + pi;
-      if (!projValid[idx]) continue;
-      const energyMul = useIntensity ? photonIntensity[slotBase + pi - 1] : 1;
-      const a = splatBaseAlpha * projFog[idx] * energyMul;
-      const cidx = idx * 3;
-      const r = (photonRGB[cidx]   * 255) | 0;
-      const g = (photonRGB[cidx+1] * 255) | 0;
-      const b = (photonRGB[cidx+2] * 255) | 0;
-      const px = projX[idx] | 0;
-      const py = projY[idx] | 0;
-      if (ltGaussian) {
-        splatLayerCtx.globalAlpha = a;
-        splatLayerCtx.drawImage(gaussianSplatCanvas(r, g, b), px - 4, py - 4);
-      } else {
-        splatLayerCtx.fillStyle = `rgba(${r},${g},${b},${a})`;
-        splatLayerCtx.fillRect(px - 1, py - 1, 3, 3);
-      }
-    }
+function drawOneSplat(slot, segIdx, useIntensity) {
+  const slotBase = slot * MAX_POINTS;
+  const idx = slotBase + segIdx;
+  if (!projValid[idx]) return;
+  const energyMul = useIntensity ? photonIntensity[slotBase + segIdx - 1] : 1;
+  const a = 0.12 * projFog[idx] * energyMul;
+  const cidx = idx * 3;
+  const r = (photonRGB[cidx]   * 255) | 0;
+  const g = (photonRGB[cidx+1] * 255) | 0;
+  const b = (photonRGB[cidx+2] * 255) | 0;
+  const px = projX[idx] | 0;
+  const py = projY[idx] | 0;
+  if (ltGaussian) {
+    splatLayerCtx.globalAlpha = a;
+    splatLayerCtx.drawImage(gaussianSplatCanvas(r, g, b), px - 4, py - 4);
+  } else {
+    splatLayerCtx.fillStyle = `rgba(${r},${g},${b},${a})`;
+    splatLayerCtx.fillRect(px - 1, py - 1, 3, 3);
   }
-  splatLayerCtx.globalAlpha = 1;
-  splatLayerCtx.globalCompositeOperation = 'source-over';
 }
 
 // silhouette de box: arestas entre face front-facing e back-facing.
@@ -561,6 +556,12 @@ function drawLightTrace(view, dt) {
     ctx.lineWidth = 1;
   }
 
+  // envelhece todos os paths existentes em 1 frame (antes do append, pra que
+  // novos paths fiquem em age=0 nesse frame). cap em 65535 pra evitar overflow.
+  for (let pi = 0; pi < photonCount; pi++) {
+    if (photonAge[pi] < 65535) photonAge[pi]++;
+  }
+
   // adiciona N caminhos novos no ring buffer
   resetIntersectCounters();
   for (let i = 0; i < ltPathsPerFrame; i++) {
@@ -617,7 +618,9 @@ function drawLightTrace(view, dt) {
   for (let pi = 0; pi < photonCount; pi++) {
     const len = photonLen[pi];
     const ibase = pi * MAX_POINTS;
-    for (let b = 0; b < lineMaxB; b++) {
+    // segmentos revelados até agora (staggered reveal)
+    const revealedB = Math.min(lineMaxB, Math.floor(photonAge[pi] / ltFramesPerBounce) + 1);
+    for (let b = 0; b < revealedB; b++) {
       if (b + 1 >= len) continue;
       const i0 = pi * MAX_POINTS + b;
       const i1 = i0 + 1;
@@ -674,15 +677,13 @@ function drawLightTrace(view, dt) {
     splatLastEnabled = true;
     if (justEnabled) {
       splatLayerCtx.clearRect(0, 0, W, H);
-      splatHeadAtLastDraw = photonHead;
     }
     // detecta mudança de câmera. Se mudou: ativa fade timer pra 1s.
     const vk = getSplatViewKey();
     if (vk !== splatLastViewKey) {
       splatLastViewKey = vk;
-      splatFadeTimer = 1; // 1 segundo de fade ativo
+      splatFadeTimer = 1;
     }
-    // fade SÓ enquanto timer ativo. Aggressive fade rate pra apagar em ~1s.
     if (splatFadeTimer > 0) {
       splatLayerCtx.globalCompositeOperation = 'destination-out';
       splatLayerCtx.fillStyle = `rgba(0,0,0,${Math.min(1, dt * 4)})`;
@@ -690,14 +691,22 @@ function drawLightTrace(view, dt) {
       splatLayerCtx.globalCompositeOperation = 'source-over';
       splatFadeTimer = Math.max(0, splatFadeTimer - dt);
     }
-    // adiciona splats das paths novas
-    const newCount = (photonHead - splatHeadAtLastDraw + MAX_PATHS) % MAX_PATHS;
-    if (newCount > 0) {
-      const startSlot = (photonHead - newCount + MAX_PATHS) % MAX_PATHS;
-      drawSplatsToLayer(startSlot, newCount, useIntensity);
-      splatHeadAtLastDraw = photonHead;
+    // splats staggered: pra cada path, pinta os splats que acabaram de ser
+    // revelados por revealedB this frame. splatStage = quantos pontos já
+    // foram splatados (1..len-1; pula o ponto 0 da luz).
+    splatLayerCtx.globalCompositeOperation = 'lighter';
+    for (let pi = 0; pi < photonCount; pi++) {
+      const len = photonLen[pi];
+      const revealedB = Math.floor(photonAge[pi] / ltFramesPerBounce) + 1;
+      const maxStage = Math.min(len - 1, revealedB);
+      while (photonSplatStage[pi] < maxStage) {
+        photonSplatStage[pi]++;
+        drawOneSplat(pi, photonSplatStage[pi], useIntensity);
+      }
     }
-    // composite simples: 1 layer só, sem soma dupla
+    splatLayerCtx.globalAlpha = 1;
+    splatLayerCtx.globalCompositeOperation = 'source-over';
+    // composite no main canvas
     ctx.globalCompositeOperation = 'lighter';
     ctx.drawImage(splatLayer, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
@@ -751,7 +760,7 @@ function drawShaded(view) {
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
 let prevRasterMode = 'wireframe';
 // câmera livre: posição em world space + euler angles
-let camPos = [0, 1.7, 6];    // perto da entrada da galeria, olhando pra alcova
+let camPos = [0, 1.7, -3];   // dentro da Field Marshals' Hall, olhando pra enfilade
 let yaw = 0, pitch = 0;
 let lastFrameTime = 0;
 const keys = Object.create(null);
@@ -1059,12 +1068,14 @@ bindCheckbox('lt-physdecay',   v => ltPhysicalDecay = v);
 bindCheckbox('lt-bvh',         v => setUseBVH(v));
 bindCheckbox('lt-wireframe',   v => ltShowWireframe = v);
 bindSlider('lt-emission', 'lt-emission-val', v => ltEmissionVar = v);
+bindSlider('lt-fpb',      'lt-fpb-val',      v => ltFramesPerBounce = Math.max(1, v|0));
 
 const ltResetBtn = document.getElementById('lt-reset');
 if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
   photonHead = 0;
   photonCount = 0;
-  splatHeadAtLastDraw = 0;
+  photonAge.fill(0);
+  photonSplatStage.fill(0);
   if (splatLayerCtx) splatLayerCtx.clearRect(0, 0, W, H);
 });
 
@@ -1132,20 +1143,10 @@ function frame() {
 }
 
 async function init() {
-  await loadScene(`${import.meta.env.BASE_URL}scenes/gallery/manifest.json`);
+  // ?scene=gallery troca cena por query param; default = hermitage-enfilade
+  const sceneId = new URLSearchParams(location.search).get('scene') || 'hermitage-enfilade';
+  await loadScene(`${import.meta.env.BASE_URL}scenes/${sceneId}/manifest.json`);
   buildVisualScene();
-  // objetos animados específicos da galeria — vivem fora do JSON da cena
-  // por enquanto (parametricos, não data-only).
-  addAnimatedSphere(
-    [-2, 0.5, -5], 0.4,
-    [0.95, 0.50, 0.18],
-    t => [-2, 0.5 + Math.abs(Math.sin(t * 1.6)) * 1.6, -5],
-  );
-  addAnimatedLight(
-    [1.8, 3.0, 0], 0.16,
-    [10, 18, 30], [160, 200, 255],
-    t => [1.8 * Math.cos(t * 0.6), 3.0, 1.8 * Math.sin(t * 0.6)],
-  );
   frame();
 }
 init();
