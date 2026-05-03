@@ -32,6 +32,9 @@ let manifestData = null;
 const allTris = [];
 const allSphs = [];
 const allLights = [];
+// snapshot do tamanho dos arrays após loadScene — pra clearRuntimeBoxes
+// truncar de volta sem mexer na geometria da cena original.
+let sceneTriCount = 0;
 
 // ---------- scene loader ----------
 export async function loadScene(manifestUrl) {
@@ -56,9 +59,19 @@ export async function loadScene(manifestUrl) {
     for (const s of room.sphs)   allSphs.push(s);
     for (const l of room.lights) allLights.push(l);
   }
+  sceneTriCount = allTris.length;
   rebuildBVH();
   activeRoom = rooms[0] || null;
   return manifestData;
+}
+
+// remove tudo que foi adicionado em runtime (via addRuntimeBox).
+// Trunca allTris pro tamanho original da cena e reconstrói o BVH.
+export function clearRuntimeBoxes() {
+  if (allTris.length > sceneTriCount) {
+    allTris.length = sceneTriCount;
+    rebuildBVH();
+  }
 }
 
 export function getManifest() { return manifestData; }
@@ -99,6 +112,27 @@ export function tickAnimation(t) {
 }
 export function getDynamicVisuals() {
   return dynamicVisual;
+}
+
+// adiciona uma box em runtime: 12 tris vão pra allTris + BVH é reconstruído.
+// Usado pelo editor de placement (drag-and-drop).
+export function addRuntimeBox(min, max, albedo) {
+  const mat = { kind: M_DIFFUSE, albedo };
+  const [x0,y0,z0] = min, [x1,y1,z1] = max;
+  const pushQuad = (p0, p1, p2, p3) => {
+    const e1 = [p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]];
+    const e2 = [p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]];
+    const n = norm(cross(e1, e2));
+    allTris.push({ v0: p0, v1: p1, v2: p2, n, mat });
+    allTris.push({ v0: p0, v1: p2, v2: p3, n, mat });
+  };
+  pushQuad([x0,y0,z0],[x0,y1,z0],[x1,y1,z0],[x1,y0,z0]);
+  pushQuad([x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]);
+  pushQuad([x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]);
+  pushQuad([x0,y1,z0],[x0,y1,z1],[x1,y1,z1],[x1,y1,z0]);
+  pushQuad([x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0]);
+  pushQuad([x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]);
+  rebuildBVH();
 }
 
 // ---------- BVH (median-split, leaf size 4) ----------

@@ -47,6 +47,20 @@
   #btn-params.visible { display: flex; }
   .vbtn.pressed { background: rgba(255,255,255,0.20); }
   .vbtn.active  { background: rgba(255,200,120,0.35); border-color: rgba(255,200,120,0.6); }
+  #btn-place, #btn-clear {
+    position: fixed; left: 12px;
+    width: 56px; height: 56px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.20);
+    border-radius: 8px;
+    color: #ddd; font-size: 13px; font-family: inherit;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; z-index: 10;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+  }
+  #btn-place { top: 12px; }
+  #btn-clear { top: 76px; font-size: 18px; }
+  #btn-place.active { background: rgba(115,178,217,0.35); border-color: rgba(115,178,217,0.7); }
   /* esconde controles touch em desktops com mouse — escolha de UI: deixar
      sempre visíveis pra ser óbvio que existem. Pode trocar pra @media. */
   .hud {
@@ -88,6 +102,8 @@
   <div class="vbtn" id="btn-down">↓</div>
   <div class="vbtn" id="btn-l">L</div>
   <div class="vbtn" id="btn-params">≡</div>
+  <div id="btn-place" title="adicionar box">+ box</div>
+  <div id="btn-clear" title="limpar boxes adicionadas">×</div>
   <div class="hud">
     modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wireframe/shaded · <b>L</b> lighttrace · <b>R</b> path tracer · <b>WASD</b> · <b>Q/E</b> ou ↑↓ · drag/touch pra olhar · fps: <b id="fps">--</b><span id="samples-info" style="display:none"> · samples: <b id="samples">0</b></span>
   </div>

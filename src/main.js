@@ -1,7 +1,7 @@
 import {
   loadScene, tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
   resetIntersectCounters, getIntersectCounters,
-  tickAnimation,
+  tickAnimation, addRuntimeBox, clearRuntimeBoxes,
   startPathTracer, stopPathTracer, setPathTracerCamera,
 } from './raytrace.js';
 
@@ -177,7 +177,10 @@ function quadEntry(q) {
 // monta a cena raster a partir de todos os cômodos. Cada entry é taggeada
 // com roomId (filtragem) e kind + dados raw (silhouette mode usa).
 // scene é populada por buildVisualScene() depois do loadScene.
+// sceneOriginalLength = comprimento após buildVisualScene; usado pra
+// truncar entries adicionados pelo editor sem afetar geometria da cena.
 const scene = [];
+let sceneOriginalLength = 0;
 function buildVisualScene() {
   scene.length = 0;
   for (const room of rooms) {
@@ -768,15 +771,25 @@ let dragging = false, lastX = 0, lastY = 0;
 // touch state
 let joystickX = 0, joystickY = 0;     // -1 a 1, atualizado pelo joystick virtual
 let touchUp = false, touchDown = false;
-let lookTouchId = null, joystickTouchId = null;
+let lookTouchId = null, joystickTouchId = null, placeTouchId = null;
 let lookLastX = 0, lookLastY = 0;
 const roomLabel = document.getElementById('room-label');
 
 canvas.addEventListener('mousedown', e => {
+  if (placeMode) {
+    if (placePhase === 'idle')        placeStartXZ(e.clientX, e.clientY);
+    else if (placePhase === 'height') placeCommit();
+    return;
+  }
   dragging = true; lastX = e.clientX; lastY = e.clientY;
 });
-window.addEventListener('mouseup', () => dragging = false);
+window.addEventListener('mouseup', e => {
+  dragging = false;
+  if (placePhase === 'xz') placeFinalizeXZ(e.clientY);
+});
 window.addEventListener('mousemove', e => {
+  if (placePhase === 'xz')     { placeMoveXZ(e.clientX, e.clientY); return; }
+  if (placePhase === 'height') { placeUpdateHeight(e.clientY);      return; }
   if (!dragging) return;
   yaw   -= (e.clientX - lastX) * 0.005;
   pitch -= (e.clientY - lastY) * 0.005;
@@ -784,6 +797,147 @@ window.addEventListener('mousemove', e => {
   pitch = Math.max(-limit, Math.min(limit, pitch));
   lastX = e.clientX; lastY = e.clientY;
 });
+
+// ---------- editor: drag-and-drop de boxes primitivas ----------
+// Desktop (mouse): 3 fases — idle → xz (drag p/ retângulo no chão) → height
+// (move mouse vertical p/ altura) → click commita.
+// Touch: comportamento simplificado — drag = posição XZ, release = commit
+// com altura padrão 1m (não dá pra ter "click again" sem cursor).
+let placeMode = false;
+let placePhase = 'idle';     // 'idle' | 'xz' | 'height'
+let placingBox = null;       // ref no scene[] enquanto desenha
+let cornerA = null, cornerB = null; // pontos no chão (XZ)
+let placingHeight = 0.1;
+let heightStartY = 0;        // mouseY de referência ao entrar em 'height'
+const PLACE_RGB = [115, 178, 217];
+const PLACE_ALB = [0.45, 0.70, 0.85];
+const HEIGHT_PX_PER_M = 60;  // sensibilidade: 60px de movimento = 1m
+
+function rayToFloor(mouseX, mouseY) {
+  const m = matMul(rotY(yaw), rotX(pitch));
+  const fwd   = matVec(m, [0, 0, -1, 0]).slice(0, 3);
+  const right = matVec(m, [1, 0,  0, 0]).slice(0, 3);
+  const up    = matVec(m, [0, 1,  0, 0]).slice(0, 3);
+  const tanHalfFov = Math.tan(fov/2);
+  const ndcX = (2*mouseX/W - 1) * aspect * tanHalfFov;
+  const ndcY = (1 - 2*mouseY/H) * tanHalfFov;
+  let dx = fwd[0] + ndcX*right[0] + ndcY*up[0];
+  let dy = fwd[1] + ndcX*right[1] + ndcY*up[1];
+  let dz = fwd[2] + ndcX*right[2] + ndcY*up[2];
+  const dl = Math.hypot(dx, dy, dz);
+  dx /= dl; dy /= dl; dz /= dl;
+  if (dy >= -1e-4) return null;
+  const t = -camPos[1] / dy;
+  if (t <= 0) return null;
+  return [camPos[0] + t*dx, 0, camPos[2] + t*dz];
+}
+
+function makeBoxEntry(min, max) {
+  return {
+    ...boxGeom(min, max), rgb: PLACE_RGB, roomId: 'editor', kind: 'box',
+    boxMin: min, boxMax: max,
+  };
+}
+
+function rebuildGhost() {
+  const x0 = Math.min(cornerA[0], cornerB[0]);
+  const x1 = Math.max(cornerA[0], cornerB[0]);
+  const z0 = Math.min(cornerA[1], cornerB[1]);
+  const z1 = Math.max(cornerA[1], cornerB[1]);
+  Object.assign(placingBox, makeBoxEntry([x0, 0, z0], [x1, placingHeight, z1]));
+}
+
+function clearGhost() {
+  if (!placingBox) return;
+  const idx = scene.indexOf(placingBox);
+  if (idx !== -1) scene.splice(idx, 1);
+  placingBox = null;
+}
+
+function placeStartXZ(mx, my) {
+  const hit = rayToFloor(mx, my);
+  if (!hit) return;
+  cornerA = [hit[0], hit[2]];
+  cornerB = [hit[0], hit[2]];
+  placingHeight = 0.05;
+  placingBox = makeBoxEntry([hit[0], 0, hit[2]], [hit[0], 0.05, hit[2]]);
+  scene.push(placingBox);
+  placePhase = 'xz';
+}
+
+function placeMoveXZ(mx, my) {
+  if (!placingBox) return;
+  const hit = rayToFloor(mx, my);
+  if (!hit) return;
+  cornerB = [hit[0], hit[2]];
+  rebuildGhost();
+}
+
+function placeFinalizeXZ(my) {
+  if (!placingBox) return;
+  const dx = Math.abs(cornerB[0] - cornerA[0]);
+  const dz = Math.abs(cornerB[1] - cornerA[1]);
+  if (dx < 0.1 || dz < 0.1) { // arrasto trivial → cancela
+    clearGhost();
+    placePhase = 'idle';
+    return;
+  }
+  heightStartY = my;
+  placingHeight = Math.min(dx, dz); // altura inicial = lado mais curto
+  rebuildGhost();
+  placePhase = 'height';
+}
+
+function placeUpdateHeight(my) {
+  if (!placingBox) return;
+  const dy = heightStartY - my; // mouse pra cima = +
+  placingHeight = Math.max(0.05, dy / HEIGHT_PX_PER_M);
+  rebuildGhost();
+}
+
+function placeCommit() {
+  if (!placingBox) return;
+  addRuntimeBox(placingBox.boxMin, placingBox.boxMax, PLACE_ALB);
+  placingBox = null;
+  placePhase = 'idle';
+  cornerA = cornerB = null;
+}
+
+function placeCancel() {
+  clearGhost();
+  placePhase = 'idle';
+  cornerA = cornerB = null;
+}
+
+// ESC cancela qualquer fase intermediária
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && placePhase !== 'idle') placeCancel();
+});
+
+function clearAllPlaced() {
+  if (placePhase !== 'idle') placeCancel();
+  scene.length = sceneOriginalLength;
+  clearRuntimeBoxes();
+  // splat layer pode ter splats de paths que bateram nas boxes — limpa.
+  if (splatLayerCtx) splatLayerCtx.clearRect(0, 0, W, H);
+}
+
+const btnClearEl = document.getElementById('btn-clear');
+if (btnClearEl) {
+  btnClearEl.addEventListener('click', clearAllPlaced);
+  btnClearEl.addEventListener('touchstart', e => { e.preventDefault(); clearAllPlaced(); }, { passive: false });
+}
+
+const btnPlaceEl = document.getElementById('btn-place');
+function togglePlaceMode() {
+  placeMode = !placeMode;
+  btnPlaceEl?.classList.toggle('active', placeMode);
+  document.body.style.cursor = placeMode ? 'crosshair' : '';
+}
+if (btnPlaceEl) {
+  btnPlaceEl.addEventListener('click', togglePlaceMode);
+  btnPlaceEl.addEventListener('touchstart', e => { e.preventDefault(); togglePlaceMode(); }, { passive: false });
+}
 
 // teclas de movimento (estado segurado, aplicado em frame() com dt)
 window.addEventListener('keydown', e => {
@@ -828,6 +982,9 @@ window.addEventListener('touchmove', e => {
     if (t.identifier === joystickTouchId) {
       updateJoystick(t);
       e.preventDefault();
+    } else if (t.identifier === placeTouchId) {
+      placeMoveXZ(t.clientX, t.clientY);
+      e.preventDefault();
     } else if (t.identifier === lookTouchId) {
       const dx = t.clientX - lookLastX;
       const dy = t.clientY - lookLastY;
@@ -842,33 +999,42 @@ window.addEventListener('touchmove', e => {
   }
 }, { passive: false });
 
-window.addEventListener('touchend', e => {
-  for (const t of e.changedTouches) {
-    if (t.identifier === joystickTouchId) {
-      joystickTouchId = null;
-      joystickX = 0; joystickY = 0;
-      joystickThumbEl.style.transform = 'translate(0,0)';
-    } else if (t.identifier === lookTouchId) {
-      lookTouchId = null;
+function endTouch(t) {
+  if (t.identifier === joystickTouchId) {
+    joystickTouchId = null;
+    joystickX = 0; joystickY = 0;
+    joystickThumbEl.style.transform = 'translate(0,0)';
+  } else if (t.identifier === placeTouchId) {
+    placeTouchId = null;
+    // touch: simplificado. Se XZ for válido, usa altura padrão e commita.
+    if (placePhase === 'xz' && placingBox) {
+      const dx = Math.abs(cornerB[0] - cornerA[0]);
+      const dz = Math.abs(cornerB[1] - cornerA[1]);
+      if (dx < 0.1 || dz < 0.1) {
+        placeCancel();
+      } else {
+        placingHeight = 1; // 1m default em mobile
+        rebuildGhost();
+        placeCommit();
+      }
     }
+  } else if (t.identifier === lookTouchId) {
+    lookTouchId = null;
   }
-});
-window.addEventListener('touchcancel', e => {
-  for (const t of e.changedTouches) {
-    if (t.identifier === joystickTouchId) {
-      joystickTouchId = null;
-      joystickX = 0; joystickY = 0;
-      joystickThumbEl.style.transform = 'translate(0,0)';
-    } else if (t.identifier === lookTouchId) {
-      lookTouchId = null;
-    }
-  }
-});
+}
+window.addEventListener('touchend',    e => { for (const t of e.changedTouches) endTouch(t); });
+window.addEventListener('touchcancel', e => { for (const t of e.changedTouches) endTouch(t); });
 
-// drag-pra-olhar: pega touches no canvas que NÃO sejam do joystick/botões
+// drag-pra-olhar (ou placement, se em placeMode): touches no canvas
 canvas.addEventListener('touchstart', e => {
   for (const t of e.changedTouches) {
     if (t.identifier === joystickTouchId) continue;
+    if (placeMode && placeTouchId === null) {
+      placeTouchId = t.identifier;
+      placeStartXZ(t.clientX, t.clientY);
+      e.preventDefault();
+      break;
+    }
     if (lookTouchId === null) {
       lookTouchId = t.identifier;
       lookLastX = t.clientX;
@@ -1147,6 +1313,7 @@ async function init() {
   const sceneId = new URLSearchParams(location.search).get('scene') || 'hermitage-enfilade';
   await loadScene(`${import.meta.env.BASE_URL}scenes/${sceneId}/manifest.json`);
   buildVisualScene();
+  sceneOriginalLength = scene.length;
   frame();
 }
 init();
