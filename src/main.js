@@ -948,8 +948,10 @@ let lastPTCamHash = null;
 
 function syncLightTracePanel() {
   if (!ltPanel) return;
-  ltPanel.classList.toggle('open', mode === 'lighttrace');
-  document.getElementById('btn-params')?.classList.toggle('visible', mode === 'lighttrace');
+  const isLT = mode === 'lighttrace';
+  document.getElementById('btn-params')?.classList.toggle('visible', isLT);
+  // painel começa fechado a cada entrada; usuário abre via botão ≡
+  if (!isLT) ltPanel.classList.remove('open');
 }
 
 // ---------- transição path tracer ----------
