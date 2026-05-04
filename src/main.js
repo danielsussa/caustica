@@ -382,6 +382,7 @@ let ltColorByBounce = true;
 let ltLineFirstOnly = false;
 let ltGaussian      = false;
 let ltFramesPerBounce = 1; // 1 = instant, N = cada bounce demora N frames pra aparecer
+let ltMaxLinesOnScreen = 1500; // cap de paths cujas LINHAS são rasterizadas/frame
 let contourPower = 0; // 0..1, controlado dinamicamente
 let ltPhysicalDecay = true;
 let ltEmissionVar   = 0.7;   // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
@@ -633,12 +634,15 @@ function drawLightTrace(view, dt) {
     }
   }
 
-  // rasteriza segments per pixel com z-test + additive blend (no mesmo buffer
-  // das paredes). Pedaço de raio atrás de parede some corretamente; pedaço
-  // que sai por uma porta pra um corredor visível aparece. Substitui o old
-  // segmentBuckets+ctx.stroke (que não tinha z-test).
+  // rasteriza segments per pixel com z-test + additive blend.
   const lineMaxB = ltLineFirstOnly ? Math.min(2, ltMaxBounces) : ltMaxBounces;
-  for (let pi = 0; pi < photonCount; pi++) {
+  const decayPow = [1, ltAlphaDecay, ltAlphaDecay*ltAlphaDecay,
+                    ltAlphaDecay*ltAlphaDecay*ltAlphaDecay,
+                    ltAlphaDecay*ltAlphaDecay*ltAlphaDecay*ltAlphaDecay];
+  const ALPHA_MIN = 0.0008;
+  const lineLimit = Math.min(photonCount, ltMaxLinesOnScreen);
+  for (let n = 0; n < lineLimit; n++) {
+    const pi = (photonHead - 1 - n + MAX_PATHS) % MAX_PATHS;
     const len = photonLen[pi];
     const ibase = pi * MAX_POINTS;
     const revealedB = Math.min(lineMaxB, Math.floor(photonAge[pi] / ltFramesPerBounce) + 1);
@@ -647,23 +651,32 @@ function drawLightTrace(view, dt) {
       const i0 = pi * MAX_POINTS + b;
       const i1 = i0 + 1;
       if (!projValid[i0] || !projValid[i1]) continue;
+      const fogAvg = (projFog[i0] + projFog[i1]) * 0.5;
+      const intensityMul = useIntensity ? Math.sqrt(photonIntensity[ibase + b]) : 1;
+      const alpha = decayPow[b] * ltAlphaBase * fogAvg * intensityMul;
+      if (alpha < ALPHA_MIN) continue;
       let r, g, bl;
       if (ltColorByBounce) {
+        // normaliza pelo max → preserva hue do bounce mas brilho fica
+        // equivalente ao da luz (sem isso, bounces ficam dim escondidos
+        // no fundo escuro da parede shaded)
         const cidx = i0 * 3;
-        r  = (photonRGB[cidx]   * 255) | 0;
-        g  = (photonRGB[cidx+1] * 255) | 0;
-        bl = (photonRGB[cidx+2] * 255) | 0;
+        const cr = photonRGB[cidx], cg = photonRGB[cidx+1], cb = photonRGB[cidx+2];
+        const mx = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+        if (mx > 0.001) {
+          const inv = 255 / mx;
+          r  = cr * inv;
+          g  = cg * inv;
+          bl = cb * inv;
+        } else {
+          r = 255; g = 220; bl = 140;
+        }
       } else {
         r = 255; g = 220; bl = 140;
       }
-      const fogAvg = (projFog[i0] + projFog[i1]) * 0.5;
-      let intensityMul = 1;
-      if (useIntensity) intensityMul = photonIntensity[ibase + b];
-      const alpha = Math.pow(ltAlphaDecay, b) * ltAlphaBase * fogAvg * intensityMul;
-      if (alpha < 0.002) continue; // pula segments quase invisíveis (perf)
       rasterLineZBufBlend(
-        [projX[i0], projY[i0], projZ[i0]],
-        [projX[i1], projY[i1], projZ[i1]],
+        projX[i0], projY[i0], projZ[i0],
+        projX[i1], projY[i1], projZ[i1],
         r * alpha, g * alpha, bl * alpha,
       );
     }
@@ -727,15 +740,16 @@ function drawLightTrace(view, dt) {
     if (justEnabled) {
       splatLayerCtx.clearRect(0, 0, W, H);
     }
-    // detecta mudança de câmera. Se mudou: ativa fade timer pra 1s.
+    // fade SÓ enquanto câmera mexe (timer de 0.5s pós-movimento pra suavizar).
+    // Câmera parada = splats acumulam pra sempre.
     const vk = getSplatViewKey();
     if (vk !== splatLastViewKey) {
       splatLastViewKey = vk;
-      splatFadeTimer = 1;
+      splatFadeTimer = 0.5;
     }
     if (splatFadeTimer > 0) {
       splatLayerCtx.globalCompositeOperation = 'destination-out';
-      splatLayerCtx.fillStyle = `rgba(0,0,0,${Math.min(1, dt * 4)})`;
+      splatLayerCtx.fillStyle = `rgba(0,0,0,${Math.min(1, dt * 5)})`;
       splatLayerCtx.fillRect(0, 0, W, H);
       splatLayerCtx.globalCompositeOperation = 'source-over';
       splatFadeTimer = Math.max(0, splatFadeTimer - dt);
@@ -822,31 +836,31 @@ function rasterLineZBufView(va, vb, pixel) {
 }
 
 // rasteriza linha com z-test + additive blend per pixel.
-// Usado pros raios de fóton em lighttrace — só pixels visíveis (z válido)
-// recebem cor; pedaço atrás de parede some corretamente.
-function rasterLineZBufBlend(p0, p1, addR, addG, addB) {
-  if (!p0 || !p1) return;
-  const x0 = p0[0], y0 = p0[1], z0 = p0[2];
-  const x1 = p1[0], y1 = p1[1], z1 = p1[2];
-  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(x1-x0), Math.abs(y1-y0))));
+// Args escalares (sem alocação por chamada). Stepping incremental.
+function rasterLineZBufBlend(x0, y0, z0, x1, y1, z1, addR, addG, addB) {
+  const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+  const adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+  const steps = Math.max(1, Math.ceil(adx > ady ? adx : ady));
   const inv = 1 / steps;
+  const stepX = dx * inv, stepY = dy * inv, stepZ = dz * inv;
   const BIAS = 0.05;
+  let cx = x0, cy = y0, cz = z0;
   for (let i = 0; i <= steps; i++) {
-    const t = i * inv;
-    const x = (x0 + (x1-x0) * t) | 0;
-    const y = (y0 + (y1-y0) * t) | 0;
-    if (x < 0 || x >= W || y < 0 || y >= H) continue;
-    const z = z0 + (z1 - z0) * t;
-    const idx = y * W + x;
-    if (z + BIAS < zbuf[idx]) continue;
-    const cur = u32[idx];
-    const cR = cur & 0xff;
-    const cG = (cur >> 8) & 0xff;
-    const cB = (cur >> 16) & 0xff;
-    const nR = Math.min(255, cR + addR) | 0;
-    const nG = Math.min(255, cG + addG) | 0;
-    const nB = Math.min(255, cB + addB) | 0;
-    u32[idx] = 0xff000000 | (nB << 16) | (nG << 8) | nR;
+    const x = cx | 0, y = cy | 0;
+    if (x >= 0 && x < W && y >= 0 && y < H) {
+      const idx = y * W + x;
+      if (cz + BIAS >= zbuf[idx]) {
+        const cur = u32[idx];
+        const nR = (cur & 0xff) + addR;
+        const nG = ((cur >> 8) & 0xff) + addG;
+        const nB = ((cur >> 16) & 0xff) + addB;
+        u32[idx] = 0xff000000
+          | ((nB > 255 ? 255 : nB | 0) << 16)
+          | ((nG > 255 ? 255 : nG | 0) << 8)
+          | (nR > 255 ? 255 : nR | 0);
+      }
+    }
+    cx += stepX; cy += stepY; cz += stepZ;
   }
 }
 
@@ -2217,6 +2231,7 @@ bindCheckbox('lt-bvh',         v => setUseBVH(v));
 bindCheckbox('lt-wireframe',   v => ltShowWireframe = v);
 bindSlider('lt-emission', 'lt-emission-val', v => ltEmissionVar = v);
 bindSlider('lt-fpb',      'lt-fpb-val',      v => ltFramesPerBounce = Math.max(1, v|0));
+bindSlider('lt-maxlines', 'lt-maxlines-val', v => ltMaxLinesOnScreen = Math.max(50, v|0));
 
 const ltResetBtn = document.getElementById('lt-reset');
 if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
