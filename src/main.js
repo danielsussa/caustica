@@ -982,30 +982,54 @@ let lookTouchId = null, joystickTouchId = null, placeTouchId = null;
 let lookLastX = 0, lookLastY = 0;
 const roomLabel = document.getElementById('room-label');
 
+// pointer lock state — quando lockado, mouse move rotaciona câmera livre (FPS)
+let pointerLocked = false;
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === canvas;
+});
+function shouldLockOnClick() {
+  // placement modes que precisam de cursor visível (box/quad/sphere) NÃO lockam
+  return placeKind === null || placeKind === 'break' || placeKind === 'wall-lamp';
+}
+
 canvas.addEventListener('mousedown', e => {
+  const mx = pointerLocked ? W/2 : e.clientX;
+  const my = pointerLocked ? H/2 : e.clientY;
   if (placeKind === 'box') {
-    if (placePhase === 'idle')        placeStartXZ(e.clientX, e.clientY);
+    if (placePhase === 'idle')        placeStartXZ(mx, my);
     else if (placePhase === 'height') placeCommit();
     return;
   }
-  if (placeKind === 'quad-light')   { placeQuadStart(e.clientX, e.clientY); return; }
-  if (placeKind === 'sphere-light') { placeSphereSingleClick(e.clientX, e.clientY); return; }
-  if (placeKind === 'break')        { breakBlock(e.clientX, e.clientY); return; }
-  // cursor mode
+  if (placeKind === 'quad-light')   { placeQuadStart(mx, my); return; }
+  if (placeKind === 'sphere-light') { placeSphereSingleClick(mx, my); return; }
+  // break/wall-lamp: 1º click locka, clicks seguintes (já lockado) executam ação
+  if (placeKind === 'break') {
+    if (pointerLocked) breakBlock(W/2, H/2);
+    else canvas.requestPointerLock();
+    return;
+  }
+  if (placeKind === 'wall-lamp') {
+    if (pointerLocked) placeLampOnWall();
+    else canvas.requestPointerLock();
+    return;
+  }
+  // cursor mode (move/rotate)
   if (transformMode === 'rotate' && selected) {
-    // qualquer drag rotaciona Y (sem precisar acertar o círculo gizmo)
-    const hit = pickAny(e.clientX, e.clientY);
+    const hit = pickAny(mx, my);
     if (hit && hit.kind === selected.kind && hit.idx === selected.idx) {
-      startRotateDrag(e.clientX);
+      startRotateDrag(mx);
       return;
     }
-    // clicou em outro item ou vazio → deseleciona/seleciona normalmente
   }
-  const axis = pickGizmoAxis(e.clientX, e.clientY);
-  if (axis !== null) { startGizmoDrag(axis, e.clientX, e.clientY); return; }
-  const hit = pickAny(e.clientX, e.clientY);
+  const axis = pickGizmoAxis(mx, my);
+  if (axis !== null) { startGizmoDrag(axis, mx, my); return; }
+  const hit = pickAny(mx, my);
   if (hit !== null) { selected = hit; return; }
   selected = null;
+  if (!pointerLocked && shouldLockOnClick()) {
+    canvas.requestPointerLock();
+    return;
+  }
   dragging = true; lastX = e.clientX; lastY = e.clientY;
 });
 window.addEventListener('mouseup', e => {
@@ -1020,6 +1044,15 @@ window.addEventListener('mousemove', e => {
   if (gizmoDragAxis !== null)  { updateGizmoDrag(e.clientX, e.clientY); return; }
   if (placePhase === 'xz')     { placeMoveXZ(e.clientX, e.clientY); return; }
   if (placePhase === 'height') { placeUpdateHeight(e.clientY);      return; }
+  // pointer lock: mouse sempre rotaciona câmera (FPS style, sem click)
+  if (pointerLocked) {
+    yaw   -= (e.movementX || 0) * 0.003;
+    pitch -= (e.movementY || 0) * 0.003;
+    const limit = Math.PI / 2 - 0.05;
+    pitch = Math.max(-limit, Math.min(limit, pitch));
+    return;
+  }
+  // sem lock: drag-to-look (fallback)
   if (!dragging) return;
   yaw   -= (e.clientX - lastX) * 0.005;
   pitch -= (e.clientY - lastY) * 0.005;
@@ -1284,6 +1317,67 @@ function breakBlock(mx, my) {
   if (nj < 0) return;
   caveVoxels.add(voxelKey(ni, nj, nk));
   rebuildAll();
+}
+
+// lampião estilo vela: holder na parede + chama (tiny point light na frente).
+// Holder = box dark; chama = sphere light bem pequena, alta emissão.
+const LAMP_HOLDER_DEPTH = 0.05;       // 5cm sai da parede
+const LAMP_HOLDER_HALF = 0.04;        // 4cm half-extents perpendicular
+const LAMP_HOLDER_ALB = [0.15, 0.10, 0.05]; // ferro escuro / madeira
+const LAMP_FLAME_OFFSET = 0.075;       // 7.5cm da parede (logo na frente do holder)
+const LAMP_FLAME_R = 0.015;           // 1.5cm raio = 3cm diâmetro (vela)
+const LAMP_FLAME_EMISSION = [60, 36, 10]; // alta intensidade compensa área pequena
+const LAMP_FLAME_RGB = [255, 175, 60];
+
+function makeWallBoxBounds(hp, nrm, depth, halfExt) {
+  const min = [hp[0], hp[1], hp[2]];
+  const max = [hp[0], hp[1], hp[2]];
+  for (let i = 0; i < 3; i++) {
+    if (nrm[i] !== 0) {
+      if (nrm[i] > 0) max[i] += depth;
+      else min[i] -= depth;
+    } else {
+      min[i] -= halfExt;
+      max[i] += halfExt;
+    }
+  }
+  return { min, max };
+}
+
+function placeLampOnWall() {
+  const [O, R] = getWorldRay(W / 2, H / 2);
+  let bestT = Infinity, bestEntry = null;
+  for (const ent of caveSceneEntries) {
+    const v = ent.verts;
+    const t = Math.min(rayTriT(O, R, v[0], v[1], v[2]), rayTriT(O, R, v[0], v[2], v[3]));
+    if (t < bestT) { bestT = t; bestEntry = ent; }
+  }
+  if (!bestEntry) return;
+  const hp = [O[0] + bestT * R[0], O[1] + bestT * R[1], O[2] + bestT * R[2]];
+  const fd = bestEntry.faceD;
+  const nrm = [-fd[0], -fd[1], -fd[2]]; // aponta pro lado vazio (cave)
+
+  // 1) holder box (sai da parede)
+  const { min, max } = makeWallBoxBounds(hp, nrm, LAMP_HOLDER_DEPTH, LAMP_HOLDER_HALF);
+  const center_b = [(min[0]+max[0])/2, (min[1]+max[1])/2, (min[2]+max[2])/2];
+  const halfExtents = [(max[0]-min[0])/2, (max[1]-min[1])/2, (max[2]-min[2])/2];
+  const verts = boxVertsFor(center_b, halfExtents, 0);
+  const boxEntry = makeBoxEntryFromVerts(verts, LAMP_HOLDER_ALB);
+  scene.push(boxEntry);
+  placedBoxes.push({ entry: boxEntry, center: center_b, halfExtents, rotY: 0, albedo: LAMP_HOLDER_ALB });
+  pushRuntimeBoxFromVerts(verts, LAMP_HOLDER_ALB);
+
+  // 2) chama (sphere light tiny, logo na frente do holder)
+  const lc = [hp[0] + nrm[0]*LAMP_FLAME_OFFSET, hp[1] + nrm[1]*LAMP_FLAME_OFFSET, hp[2] + nrm[2]*LAMP_FLAME_OFFSET];
+  const lightEntry = {
+    ...sphereGeom(lc, LAMP_FLAME_R, 10, 14), rgb: LAMP_FLAME_RGB, emissive: true,
+    roomId: 'editor', kind: 'sphere', sphCenter: lc, sphRadius: LAMP_FLAME_R,
+  };
+  scene.push(lightEntry);
+  placedSphereLights.push({ entry: lightEntry, center: lc, r: LAMP_FLAME_R, emission: LAMP_FLAME_EMISSION });
+  addRuntimeSphereLight(lc, LAMP_FLAME_R, LAMP_FLAME_EMISSION);
+
+  rebuildRuntimeBVH();
 }
 
 function raySphereT(ro, rd, c, r) {
@@ -1858,54 +1952,86 @@ if (btnClearEl) {
   btnClearEl.addEventListener('touchstart', e => { e.preventDefault(); clearAllPlaced(); }, { passive: false });
 }
 
-const btnCursorEl      = document.getElementById('btn-cursor');
-const btnMoveEl        = document.getElementById('btn-move');
-const btnRotateEl      = document.getElementById('btn-rotate');
-const btnBreakEl       = document.getElementById('btn-break');
-const btnPlaceEl       = document.getElementById('btn-place');
-const btnQuadLightEl   = document.getElementById('btn-quad-light');
-const btnSphereLightEl = document.getElementById('btn-sphere-light');
+// ---------- carrossel de ferramentas (top-center, estilo jogo) ----------
+// Setas ←/→ ou click nos icones laterais ciclam. Ícone central = ativo.
+const TOOL_SVGS = {
+  move: '<polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" x2="22" y1="12" y2="12"/><line x1="12" x2="12" y1="2" y2="22"/>',
+  rotate: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
+  break: '<path d="m14 12-8.5 8.5a2.12 2.12 0 0 1-3-3L11 9"/><path d="M15 13 9 7l4-4 6 6h3a8 8 0 0 1-7 7z"/>',
+  box: '<path d="M16 16h6"/><path d="M19 13v6"/><path d="M21 10V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l5-2.88"/><path d="M16.5 9.4 7.55 4.24"/><path d="M3.29 7 12 12l8.71-5"/><path d="M12 22V12"/>',
+  'quad-light': '<rect x="3" y="5" width="18" height="6" rx="1"/><line x1="6"  y1="14" x2="6"  y2="16"/><line x1="10" y1="14" x2="10" y2="17"/><line x1="12" y1="14" x2="12" y2="18"/><line x1="14" y1="14" x2="14" y2="17"/><line x1="18" y1="14" x2="18" y2="16"/>',
+  'sphere-light': '<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/>',
+  'wall-lamp': '<path d="M8 2h8l4 10H4L8 2Z"/><path d="M12 12v6"/><path d="M8 22v-2c0-1.1.9-2 2-2h4a2 2 0 0 1 2 2v2H8Z"/>',
+};
+const TOOLS = [
+  { id: 'move',         label: 'mover (selecione + arrasta setas)' },
+  { id: 'rotate',       label: 'rotacionar (selecione + arrasta)' },
+  { id: 'box',          label: 'adicionar box' },
+  { id: 'quad-light',   label: 'adicionar luz plana' },
+  { id: 'sphere-light', label: 'adicionar luz esférica' },
+  { id: 'wall-lamp',    label: 'lampião na parede (mira + ESPACO)' },
+  { id: 'break',        label: 'quebrar bloco (mira + ESPACO)' },
+];
+let toolIndex = TOOLS.findIndex(t => t.id === 'break');
 
-function setTransformMode(mode) {
-  transformMode = mode;
-  btnMoveEl?.classList.toggle('active',   mode === 'move');
-  btnRotateEl?.classList.toggle('active', mode === 'rotate');
-}
-function bindTransformBtn(el, mode) {
-  if (!el) return;
-  el.addEventListener('click', () => setTransformMode(mode));
-  el.addEventListener('touchstart', e => { e.preventDefault(); setTransformMode(mode); }, { passive: false });
-}
-bindTransformBtn(btnMoveEl,   'move');
-bindTransformBtn(btnRotateEl, 'rotate');
-btnMoveEl?.classList.add('active'); // default = move
-
-function setPlaceKind(kind) {
+function applyTool(id) {
   if (placePhase !== 'idle') placeCancel();
-  placeKind = (placeKind === kind) ? null : kind;
-  btnCursorEl?.classList.toggle('active',      placeKind === null);
-  btnPlaceEl?.classList.toggle('active',       placeKind === 'box');
-  btnQuadLightEl?.classList.toggle('active',   placeKind === 'quad-light');
-  btnSphereLightEl?.classList.toggle('active', placeKind === 'sphere-light');
-  btnBreakEl?.classList.toggle('active',       placeKind === 'break');
-  document.body.style.cursor = placeKind ? 'crosshair' : '';
+  if (id === 'move') {
+    placeKind = null;
+    transformMode = 'move';
+  } else if (id === 'rotate') {
+    placeKind = null;
+    transformMode = 'rotate';
+  } else {
+    placeKind = id;
+    transformMode = 'move';
+  }
+  const usesSpaceAim = placeKind === 'break' || placeKind === 'wall-lamp';
+  const useCursorCrosshair = placeKind && !usesSpaceAim;
+  document.body.style.cursor = useCursorCrosshair ? 'crosshair' : 'none';
+  document.getElementById('crosshair')?.classList.toggle('visible', usesSpaceAim);
+  // se entrou em placement-mode com cursor, sai do pointer lock pra ver mouse
+  if (useCursorCrosshair && pointerLocked) document.exitPointerLock();
 }
-function bindKindBtn(el, kind) {
-  if (!el) return;
-  el.addEventListener('click', () => setPlaceKind(kind));
-  el.addEventListener('touchstart', e => { e.preventDefault(); setPlaceKind(kind); }, { passive: false });
+function svgWrap(inner) {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
 }
-bindKindBtn(btnCursorEl,      null);
-bindKindBtn(btnPlaceEl,       'box');
-bindKindBtn(btnQuadLightEl,   'quad-light');
-bindKindBtn(btnSphereLightEl, 'sphere-light');
-bindKindBtn(btnBreakEl,       'break');
+const toolPrevEl = document.getElementById('tool-prev');
+const toolCurrEl = document.getElementById('tool-current');
+const toolNextEl = document.getElementById('tool-next');
+const toolLabelEl = document.getElementById('tool-label');
+function renderToolCarousel() {
+  const prev = (toolIndex - 1 + TOOLS.length) % TOOLS.length;
+  const next = (toolIndex + 1) % TOOLS.length;
+  if (toolPrevEl) toolPrevEl.innerHTML = svgWrap(TOOL_SVGS[TOOLS[prev].id]);
+  if (toolCurrEl) toolCurrEl.innerHTML = svgWrap(TOOL_SVGS[TOOLS[toolIndex].id]);
+  if (toolNextEl) toolNextEl.innerHTML = svgWrap(TOOL_SVGS[TOOLS[next].id]);
+  if (toolLabelEl) toolLabelEl.textContent = TOOLS[toolIndex].label;
+}
+function cycleTool(dir) {
+  toolIndex = (toolIndex + dir + TOOLS.length) % TOOLS.length;
+  applyTool(TOOLS[toolIndex].id);
+  renderToolCarousel();
+}
+toolPrevEl?.addEventListener('click', () => cycleTool(-1));
+toolNextEl?.addEventListener('click', () => cycleTool(+1));
+toolPrevEl?.addEventListener('touchstart', e => { e.preventDefault(); cycleTool(-1); }, { passive: false });
+toolNextEl?.addEventListener('touchstart', e => { e.preventDefault(); cycleTool(+1); }, { passive: false });
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft')  { cycleTool(-1); e.preventDefault(); }
+  if (e.key === 'ArrowRight') { cycleTool(+1); e.preventDefault(); }
+});
+renderToolCarousel();
+applyTool(TOOLS[toolIndex].id);
 
 // teclas de movimento (estado segurado, aplicado em frame() com dt)
 window.addEventListener('keydown', e => {
   keys[e.code] = true;
-  // bloqueia scroll do espaço
-  if (e.code === 'Space') e.preventDefault();
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (placeKind === 'break')     breakBlock(W / 2, H / 2);
+    if (placeKind === 'wall-lamp') placeLampOnWall();
+  }
 }, { passive: false });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 
@@ -1995,11 +2121,7 @@ canvas.addEventListener('touchstart', e => {
       e.preventDefault();
       break;
     }
-    if (placeKind === 'break') {
-      breakBlock(t.clientX, t.clientY);
-      e.preventDefault();
-      break;
-    }
+    // break não responde a touch — usa botão dedicado no HUD
     if (placeKind && placeTouchId === null) {
       placeTouchId = t.identifier;
       if (placeKind === 'box')          placeStartXZ(t.clientX, t.clientY);
