@@ -1,7 +1,9 @@
 import {
-  loadScene, tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, setUseBVH,
+  loadScene, tracePhotonPath, rooms, setActiveRoomByPos, getActiveRoomId, getActiveRoomBounds, setUseBVH,
   resetIntersectCounters, getIntersectCounters,
-  tickAnimation, addRuntimeBox, clearRuntimeBoxes,
+  tickAnimation, addRuntimeBox, addRuntimeBoxFromVerts, pushRuntimeBoxFromVerts,
+  addRuntimeQuadLight, addRuntimeSphereLight, addRuntimeQuad, rebuildRuntimeBVH,
+  clearRuntimeBoxes, clearRuntimeLights,
   startPathTracer, stopPathTracer, setPathTracerCamera,
 } from './raytrace.js';
 
@@ -238,6 +240,51 @@ function project(v) {
   ];
 }
 
+// near-plane clip de triângulo em view space. Retorna array de tris (1 ou 2)
+// totalmente na frente do near plane, ou [] se inteiramente atrás.
+// Sem isso, tris com 1+ vértice atrás da câmera somem (project retorna null
+// e rasterTri descarta) → paredes "recortam" quando você encosta nelas.
+const NEAR_PLANE = 0.05;
+function clipEdgeNear(vIn, vOut) {
+  const t = (-NEAR_PLANE - vIn[2]) / (vOut[2] - vIn[2]);
+  return [
+    vIn[0] + t * (vOut[0] - vIn[0]),
+    vIn[1] + t * (vOut[1] - vIn[1]),
+    -NEAR_PLANE, 1,
+  ];
+}
+function clipTriNear(v0, v1, v2, out) {
+  out.length = 0;
+  const i0 = v0[2] < -NEAR_PLANE;
+  const i1 = v1[2] < -NEAR_PLANE;
+  const i2 = v2[2] < -NEAR_PLANE;
+  const cnt = (i0?1:0) + (i1?1:0) + (i2?1:0);
+  if (cnt === 0) return out;
+  if (cnt === 3) { out.push([v0, v1, v2]); return out; }
+  if (cnt === 2) {
+    // 2 in, 1 out: emit quad → 2 tris
+    let vb, vfa, vfb;
+    if (!i0)      { vb = v0; vfa = v1; vfb = v2; }
+    else if (!i1) { vb = v1; vfa = v2; vfb = v0; }
+    else          { vb = v2; vfa = v0; vfb = v1; }
+    const cA = clipEdgeNear(vfa, vb);
+    const cB = clipEdgeNear(vfb, vb);
+    out.push([vfa, vfb, cB]);
+    out.push([vfa, cB, cA]);
+  } else {
+    // 1 in, 2 out: 1 tri
+    let vf, vba, vbb;
+    if (i0)      { vf = v0; vba = v1; vbb = v2; }
+    else if (i1) { vf = v1; vba = v2; vbb = v0; }
+    else         { vf = v2; vba = v0; vbb = v1; }
+    const cA = clipEdgeNear(vf, vba);
+    const cB = clipEdgeNear(vf, vbb);
+    out.push([vf, cA, cB]);
+  }
+  return out;
+}
+const _clipBuf = []; // scratch
+
 // ---------- rasterização (triângulo preenchido + z-buffer) ----------
 function rasterTri(p0, p1, p2, r, g, b) {
   if (!p0 || !p1 || !p2) return;
@@ -367,6 +414,7 @@ function appendPhotonPath(pts, cols, intensities) {
 // scratch pra projeção (alocado uma vez)
 const projX = new Float32Array(MAX_PATHS * MAX_POINTS);
 const projY = new Float32Array(MAX_PATHS * MAX_POINTS);
+const projZ = new Float32Array(MAX_PATHS * MAX_POINTS); // view-space z, pra z-test contra zbuf das paredes
 const projFog = new Float32Array(MAX_PATHS * MAX_POINTS);
 const projValid = new Uint8Array(MAX_PATHS * MAX_POINTS);
 
@@ -402,14 +450,18 @@ function drawOneSplat(slot, segIdx, useIntensity) {
   const slotBase = slot * MAX_POINTS;
   const idx = slotBase + segIdx;
   if (!projValid[idx]) return;
+  const px = projX[idx] | 0;
+  const py = projY[idx] | 0;
+  // z-test contra zbuf das paredes: skip se splat tá atrás de uma parede mais próxima
+  if (px >= 0 && px < W && py >= 0 && py < H) {
+    if (projZ[idx] + 0.05 < zbuf[py * W + px]) return;
+  }
   const energyMul = useIntensity ? photonIntensity[slotBase + segIdx - 1] : 1;
   const a = 0.12 * projFog[idx] * energyMul;
   const cidx = idx * 3;
   const r = (photonRGB[cidx]   * 255) | 0;
   const g = (photonRGB[cidx+1] * 255) | 0;
   const b = (photonRGB[cidx+2] * 255) | 0;
-  const px = projX[idx] | 0;
-  const py = projY[idx] | 0;
   if (ltGaussian) {
     splatLayerCtx.globalAlpha = a;
     splatLayerCtx.drawImage(gaussianSplatCanvas(r, g, b), px - 4, py - 4);
@@ -499,65 +551,32 @@ function gaussianSplatCanvas(r, g, b) {
 }
 
 function drawLightTrace(view, dt) {
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, W, H);
+  // 1. paredes shaded escuras (z-buffered + near clip)
+  ensureBuffers();
+  u32.fill(0xff000000);
+  zbuf.fill(-Infinity);
+  for (const obj of scene) {
+    if (!obj.tris) continue;
+    const viewVerts = obj.verts.map(p => matVec(view, [p[0], p[1], p[2], 1]));
+    const [br, bg, bb] = obj.rgb;
+    const intensity = obj.emissive ? 1.0 : 0.10;
+    const r = Math.min(255, br * intensity) | 0;
+    const g = Math.min(255, bg * intensity) | 0;
+    const b = Math.min(255, bb * intensity) | 0;
+    for (const [i0, i1, i2] of obj.tris) {
+      const v0 = viewVerts[i0], v1 = viewVerts[i1], v2 = viewVerts[i2];
+      const tris = clipTriNear(v0, v1, v2, _clipBuf);
+      for (const [c0, c1, c2] of tris) {
+        rasterTri(project(c0), project(c1), project(c2), r, g, b);
+      }
+    }
+  }
+  // NÃO faz putImageData aqui — segments serão rasterizados no mesmo buffer
 
-  // wireframe (incluindo a esfera de luz) só quando ltShowWireframe.
-  // Mostra TODOS os cômodos — fog culling esconde os longe naturalmente.
-  ctx.lineWidth = 1;
-  if (ltShowWireframe) {
-    for (const obj of scene) {
-      const projected = obj.verts.map(p => {
-        const v = matVec(view, [p[0], p[1], p[2], 1]);
-        return project(v);
-      });
-      const [r, g, b] = obj.rgb;
-      ctx.strokeStyle = obj.emissive
-        ? `rgba(${r},${g},${b},0.85)`
-        : `rgba(${r},${g},${b},0.18)`;
-      ctx.beginPath();
-      for (const [a, b2] of obj.edges) {
-        const pa = projected[a], pb = projected[b2];
-        if (!pa || !pb) continue;
-        ctx.moveTo(pa[0], pa[1]);
-        ctx.lineTo(pb[0], pb[1]);
-      }
-      ctx.stroke();
-    }
-  }
-  // contornos dinâmicos: fade-in rápido quando câmera mexe (splatFadeTimer > 0),
-  // fade-out lento quando para (splats vão acumulando, contorno some)
+  // contornos dinâmicos timer (visual depois do putImageData lá embaixo)
   const contourTarget = splatFadeTimer > 0 ? 1 : 0;
-  const contourRate = contourTarget > contourPower ? 2 : 0.5; // ~1.5s in, ~6s out
+  const contourRate = contourTarget > contourPower ? 2 : 0.5;
   contourPower += (contourTarget - contourPower) * Math.min(1, dt * contourRate);
-  if (contourPower > 0.01) {
-    ctx.lineWidth = 1.2;
-    for (const obj of scene) {
-      const [r, g, b] = obj.rgb;
-      const a = 0.2 * contourPower;
-      ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
-      if (obj.kind === 'box') {
-        drawBoxContour(view, obj.boxMin, obj.boxMax);
-      } else if (obj.kind === 'sphere') {
-        drawSphereContour(view, obj.sphCenter, obj.sphRadius);
-      } else {
-        // quad: já é um retângulo, perímetro = contorno
-        const projected = obj.verts.map(p => {
-          const v = matVec(view, [p[0], p[1], p[2], 1]);
-          return project(v);
-        });
-        ctx.beginPath();
-        for (const [a, b2] of obj.edges) {
-          const pa = projected[a], pb = projected[b2];
-          if (!pa || !pb) continue;
-          ctx.moveTo(pa[0], pa[1]);
-          ctx.lineTo(pb[0], pb[1]);
-        }
-        ctx.stroke();
-      }
-    }
-    ctx.lineWidth = 1;
-  }
 
   // envelhece todos os paths existentes em 1 frame (antes do append, pra que
   // novos paths fiquem em age=0 nesse frame). cap em 65535 pra evitar overflow.
@@ -608,20 +627,20 @@ function drawLightTrace(view, dt) {
       const cy = m10*wx + m11*wy + m12*wz + m13;
       projX[idx] = (fxa * cx / w + 1) * halfW;
       projY[idx] = (1 - f * cy / w) * halfH;
+      projZ[idx] = cz; // view-space z negativo
       projFog[idx] = ltFog ? Math.exp(-w * FOG_STRENGTH) : 1;
       projValid[idx] = 1;
     }
   }
 
-  // strokes batched por (cor, bounce, fog, intensity). Quando ltPhysicalDecay
-  // é off, intensity bucket fica fixo em 0 — ainda batch-friendly. Quando on,
-  // adiciona dim de discretização (8 buckets) → ~160-640 strokes. Rápido.
-  for (const [, arr] of segmentBuckets) arr.length = 0;
+  // rasteriza segments per pixel com z-test + additive blend (no mesmo buffer
+  // das paredes). Pedaço de raio atrás de parede some corretamente; pedaço
+  // que sai por uma porta pra um corredor visível aparece. Substitui o old
+  // segmentBuckets+ctx.stroke (que não tinha z-test).
   const lineMaxB = ltLineFirstOnly ? Math.min(2, ltMaxBounces) : ltMaxBounces;
   for (let pi = 0; pi < photonCount; pi++) {
     const len = photonLen[pi];
     const ibase = pi * MAX_POINTS;
-    // segmentos revelados até agora (staggered reveal)
     const revealedB = Math.min(lineMaxB, Math.floor(photonAge[pi] / ltFramesPerBounce) + 1);
     for (let b = 0; b < revealedB; b++) {
       if (b + 1 >= len) continue;
@@ -638,35 +657,62 @@ function drawLightTrace(view, dt) {
         r = 255; g = 220; bl = 140;
       }
       const fogAvg = (projFog[i0] + projFog[i1]) * 0.5;
-      const fb = Math.min(N_FOG_BUCKETS - 1, (fogAvg * N_FOG_BUCKETS) | 0);
-      let ib = 0;
-      if (useIntensity) {
-        // intensidade durante este segmento = energia deixando ponto i0.
-        // clamp pra bucket válido (intensity pode ser > 1 com emission var)
-        const intensity = photonIntensity[ibase + b];
-        const ibIdx = (intensity * 0.5 * N_INTENSITY_BUCKETS) | 0; // mapeia [0,2] → [0,N)
-        ib = Math.max(0, Math.min(N_INTENSITY_BUCKETS - 1, ibIdx));
-      }
-      const key = `${r},${g},${bl},${b},${fb},${ib}`;
-      let arr = segmentBuckets.get(key);
-      if (!arr) segmentBuckets.set(key, arr = []);
-      arr.push(projX[i0], projY[i0], projX[i1], projY[i1]);
+      let intensityMul = 1;
+      if (useIntensity) intensityMul = photonIntensity[ibase + b];
+      const alpha = Math.pow(ltAlphaDecay, b) * ltAlphaBase * fogAvg * intensityMul;
+      if (alpha < 0.002) continue; // pula segments quase invisíveis (perf)
+      rasterLineZBufBlend(
+        [projX[i0], projY[i0], projZ[i0]],
+        [projX[i1], projY[i1], projZ[i1]],
+        r * alpha, g * alpha, bl * alpha,
+      );
     }
   }
+  ctx.putImageData(imageData, 0, 0);
+
+  // wireframe opcional (overlay ctx, sem z-test)
   ctx.lineWidth = 1;
-  for (const [key, segs] of segmentBuckets) {
-    if (segs.length === 0) continue;
-    const [r, g, bl, b, fb, ib] = key.split(',');
-    const baseAlpha = Math.pow(ltAlphaDecay, +b) * ltAlphaBase;
-    const fogMul = (+fb + 0.5) / N_FOG_BUCKETS;
-    const intensityMul = useIntensity ? (+ib + 0.5) * 2 / N_INTENSITY_BUCKETS : 1;
-    ctx.strokeStyle = `rgba(${r},${g},${bl},${baseAlpha * fogMul * intensityMul})`;
-    ctx.beginPath();
-    for (let i = 0; i < segs.length; i += 4) {
-      ctx.moveTo(segs[i], segs[i+1]);
-      ctx.lineTo(segs[i+2], segs[i+3]);
+  if (ltShowWireframe) {
+    for (const obj of scene) {
+      const projected = obj.verts.map(p => project(matVec(view, [p[0], p[1], p[2], 1])));
+      const [r, g, b] = obj.rgb;
+      ctx.strokeStyle = obj.emissive
+        ? `rgba(${r},${g},${b},0.85)`
+        : `rgba(${r},${g},${b},0.18)`;
+      ctx.beginPath();
+      for (const [a, b2] of obj.edges) {
+        const pa = projected[a], pb = projected[b2];
+        if (!pa || !pb) continue;
+        ctx.moveTo(pa[0], pa[1]);
+        ctx.lineTo(pb[0], pb[1]);
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
+  }
+  // contornos dinâmicos (fade overlay quando câmera mexe)
+  if (contourPower > 0.01) {
+    ctx.lineWidth = 1.2;
+    for (const obj of scene) {
+      const [r, g, b] = obj.rgb;
+      const a = 0.2 * contourPower;
+      ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
+      if (obj.kind === 'box') {
+        drawBoxContour(view, obj.boxMin, obj.boxMax);
+      } else if (obj.kind === 'sphere') {
+        drawSphereContour(view, obj.sphCenter, obj.sphRadius);
+      } else {
+        const projected = obj.verts.map(p => project(matVec(view, [p[0], p[1], p[2], 1])));
+        ctx.beginPath();
+        for (const [a, b2] of obj.edges) {
+          const pa = projected[a], pb = projected[b2];
+          if (!pa || !pb) continue;
+          ctx.moveTo(pa[0], pa[1]);
+          ctx.lineTo(pb[0], pb[1]);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.lineWidth = 1;
   }
 
   // splats: layer persistente que acumula até a câmera mover. Em vez de
@@ -726,13 +772,10 @@ function drawShaded(view) {
   for (const obj of scene) {
     if (!obj.tris) continue;
     const viewVerts = obj.verts.map(p => matVec(view, [p[0], p[1], p[2], 1]));
-    const projVerts = viewVerts.map(v => project(v));
     const [br, bg, bb] = obj.rgb;
 
     for (const [i0, i1, i2] of obj.tris) {
       const v0 = viewVerts[i0], v1 = viewVerts[i1], v2 = viewVerts[i2];
-
-      // normal em view space
       const e1x = v1[0]-v0[0], e1y = v1[1]-v0[1], e1z = v1[2]-v0[2];
       const e2x = v2[0]-v0[0], e2y = v2[1]-v0[1], e2z = v2[2]-v0[2];
       const nx = e1y*e2z - e1z*e2y;
@@ -741,18 +784,165 @@ function drawShaded(view) {
       const len = Math.hypot(nx, ny, nz);
       if (len < 1e-9) continue;
       let intensity;
-      if (obj.emissive) {
-        intensity = 1;
-      } else {
+      if (obj.emissive) intensity = 1;
+      else {
         const ndotl = Math.abs((nx*LIGHT[0] + ny*LIGHT[1] + nz*LIGHT[2]) / len);
         intensity = 0.2 + 0.8 * ndotl;
       }
-
       const r = Math.min(255, br * intensity) | 0;
       const g = Math.min(255, bg * intensity) | 0;
       const b = Math.min(255, bb * intensity) | 0;
+      // clip near plane → 1 ou 2 sub-tris totalmente à frente
+      const tris = clipTriNear(v0, v1, v2, _clipBuf);
+      for (const [c0, c1, c2] of tris) {
+        rasterTri(project(c0), project(c1), project(c2), r, g, b);
+      }
+    }
+  }
 
-      rasterTri(projVerts[i0], projVerts[i1], projVerts[i2], r, g, b);
+  ctx.putImageData(imageData, 0, 0);
+}
+
+// ---------- solid: paredes opacas + edges + grid, tudo z-buffered ----------
+// Renderiza tudo (face fill, edges, grid) no buffer raster com z-test, então
+// o que tá atrás da parede é REALMENTE escondido. ctx.lineTo (sem z) seria
+// transparente: edges/grid de paredes distantes aparecem por cima da próxima.
+
+// rasteriza linha já clipada/projetada + clipper de view-space → projeta
+function rasterLineZBufView(va, vb, pixel) {
+  // ambos atrás do near plane → skip
+  const i0 = va[2] < -NEAR_PLANE;
+  const i1 = vb[2] < -NEAR_PLANE;
+  if (!i0 && !i1) return;
+  let pa, pb;
+  if (i0 && i1) { pa = project(va); pb = project(vb); }
+  else if (i0)  { pa = project(va); pb = project(clipEdgeNear(va, vb)); }
+  else          { pa = project(clipEdgeNear(vb, va)); pb = project(vb); }
+  rasterLineZBuf(pa, pb, pixel);
+}
+
+// rasteriza linha com z-test + additive blend per pixel.
+// Usado pros raios de fóton em lighttrace — só pixels visíveis (z válido)
+// recebem cor; pedaço atrás de parede some corretamente.
+function rasterLineZBufBlend(p0, p1, addR, addG, addB) {
+  if (!p0 || !p1) return;
+  const x0 = p0[0], y0 = p0[1], z0 = p0[2];
+  const x1 = p1[0], y1 = p1[1], z1 = p1[2];
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(x1-x0), Math.abs(y1-y0))));
+  const inv = 1 / steps;
+  const BIAS = 0.05;
+  for (let i = 0; i <= steps; i++) {
+    const t = i * inv;
+    const x = (x0 + (x1-x0) * t) | 0;
+    const y = (y0 + (y1-y0) * t) | 0;
+    if (x < 0 || x >= W || y < 0 || y >= H) continue;
+    const z = z0 + (z1 - z0) * t;
+    const idx = y * W + x;
+    if (z + BIAS < zbuf[idx]) continue;
+    const cur = u32[idx];
+    const cR = cur & 0xff;
+    const cG = (cur >> 8) & 0xff;
+    const cB = (cur >> 16) & 0xff;
+    const nR = Math.min(255, cR + addR) | 0;
+    const nG = Math.min(255, cG + addG) | 0;
+    const nB = Math.min(255, cB + addB) | 0;
+    u32[idx] = 0xff000000 | (nB << 16) | (nG << 8) | nR;
+  }
+}
+
+function rasterLineZBufBlendView(va, vb, addR, addG, addB) {
+  const i0 = va[2] < -NEAR_PLANE;
+  const i1 = vb[2] < -NEAR_PLANE;
+  if (!i0 && !i1) return;
+  let pa, pb;
+  if (i0 && i1) { pa = project(va); pb = project(vb); }
+  else if (i0)  { pa = project(va); pb = project(clipEdgeNear(va, vb)); }
+  else          { pa = project(clipEdgeNear(vb, va)); pb = project(vb); }
+  rasterLineZBufBlend(pa, pb, addR, addG, addB);
+}
+
+// rasteriza linha 1px com z-test (interp linear de z)
+function rasterLineZBuf(p0, p1, pixel) {
+  if (!p0 || !p1) return;
+  const x0 = p0[0], y0 = p0[1], z0 = p0[2];
+  const x1 = p1[0], y1 = p1[1], z1 = p1[2];
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(x1-x0), Math.abs(y1-y0))));
+  const inv = 1 / steps;
+  // bias positivo (z negativo em view space; +bias = mais perto)
+  const BIAS = 0.01;
+  for (let i = 0; i <= steps; i++) {
+    const t = i * inv;
+    const x = (x0 + (x1-x0) * t) | 0;
+    const y = (y0 + (y1-y0) * t) | 0;
+    if (x < 0 || x >= W || y < 0 || y >= H) continue;
+    const z = z0 + (z1 - z0) * t + BIAS;
+    const idx = y * W + x;
+    if (z > zbuf[idx]) u32[idx] = pixel;
+  }
+}
+
+function drawSolid(view) {
+  ensureBuffers();
+  u32.fill(0xff000000);
+  zbuf.fill(-Infinity);
+
+  // 1. faces (shaded fill, z-buffered, com near-plane clipping)
+  for (const obj of scene) {
+    if (!obj.tris) continue;
+    const viewVerts = obj.verts.map(p => matVec(view, [p[0], p[1], p[2], 1]));
+    const [br, bg, bb] = obj.rgb;
+    for (const [i0, i1, i2] of obj.tris) {
+      const v0 = viewVerts[i0], v1 = viewVerts[i1], v2 = viewVerts[i2];
+      const e1x = v1[0]-v0[0], e1y = v1[1]-v0[1], e1z = v1[2]-v0[2];
+      const e2x = v2[0]-v0[0], e2y = v2[1]-v0[1], e2z = v2[2]-v0[2];
+      const nx = e1y*e2z - e1z*e2y;
+      const ny = e1z*e2x - e1x*e2z;
+      const nz = e1x*e2y - e1y*e2x;
+      const len = Math.hypot(nx, ny, nz);
+      if (len < 1e-9) continue;
+      let intensity;
+      if (obj.emissive) intensity = 1;
+      else {
+        const ndotl = Math.abs((nx*LIGHT[0] + ny*LIGHT[1] + nz*LIGHT[2]) / len);
+        intensity = 0.2 + 0.8 * ndotl;
+      }
+      const r = Math.min(255, br * intensity) | 0;
+      const g = Math.min(255, bg * intensity) | 0;
+      const b = Math.min(255, bb * intensity) | 0;
+      const tris = clipTriNear(v0, v1, v2, _clipBuf);
+      for (const [c0, c1, c2] of tris) {
+        rasterTri(project(c0), project(c1), project(c2), r, g, b);
+      }
+    }
+  }
+
+  // 2. edges (z-buffered + near clip)
+  for (const obj of scene) {
+    const viewVerts = obj.verts.map(p => matVec(view, [p[0], p[1], p[2], 1]));
+    const [r, g, b] = obj.rgb;
+    const er = Math.min(255, r + 60), eg = Math.min(255, g + 60), eb = Math.min(255, b + 60);
+    const pixel = 0xff000000 | (eb << 16) | (eg << 8) | er;
+    for (const [a, b2] of obj.edges) {
+      rasterLineZBufView(viewVerts[a], viewVerts[b2], pixel);
+    }
+  }
+
+  // 3. cave wall grid (10cm subdiv, z-buffered + near clip)
+  if (caveSceneEntries.length > 0) {
+    const gridPixel = 0xff8090a0;
+    const N = 10;
+    for (const e of caveSceneEntries) {
+      const [p0, p1, p2, p3] = e.verts;
+      const ux = (p1[0]-p0[0])/N, uy = (p1[1]-p0[1])/N, uz = (p1[2]-p0[2])/N;
+      const vx = (p3[0]-p0[0])/N, vy = (p3[1]-p0[1])/N, vz = (p3[2]-p0[2])/N;
+      for (let i = 1; i < N; i++) {
+        const a = matVec(view, [p0[0]+i*ux, p0[1]+i*uy, p0[2]+i*uz, 1]);
+        const b = matVec(view, [p3[0]+i*ux, p3[1]+i*uy, p3[2]+i*uz, 1]);
+        rasterLineZBufView(a, b, gridPixel);
+        const c = matVec(view, [p0[0]+i*vx, p0[1]+i*vy, p0[2]+i*vz, 1]);
+        const d = matVec(view, [p1[0]+i*vx, p1[1]+i*vy, p1[2]+i*vz, 1]);
+        rasterLineZBufView(c, d, gridPixel);
+      }
     }
   }
 
@@ -763,7 +953,10 @@ function drawShaded(view) {
 let mode = 'wireframe';      // wireframe | shaded | lighttrace
 let prevRasterMode = 'wireframe';
 // câmera livre: posição em world space + euler angles
-let camPos = [0, 1.7, 0];    // centro da cena vazia
+// Minecraft-like: player preso ao chão com colisão de paredes
+const PLAYER_HEIGHT = 1.5;
+const PLAYER_RADIUS = 0.3;
+let camPos = [0, PLAYER_HEIGHT, 0];
 let yaw = 0, pitch = 0;
 let lastFrameTime = 0;
 const keys = Object.create(null);
@@ -776,18 +969,41 @@ let lookLastX = 0, lookLastY = 0;
 const roomLabel = document.getElementById('room-label');
 
 canvas.addEventListener('mousedown', e => {
-  if (placeMode) {
+  if (placeKind === 'box') {
     if (placePhase === 'idle')        placeStartXZ(e.clientX, e.clientY);
     else if (placePhase === 'height') placeCommit();
     return;
   }
+  if (placeKind === 'quad-light')   { placeQuadStart(e.clientX, e.clientY); return; }
+  if (placeKind === 'sphere-light') { placeSphereSingleClick(e.clientX, e.clientY); return; }
+  if (placeKind === 'break')        { breakBlock(e.clientX, e.clientY); return; }
+  // cursor mode
+  if (transformMode === 'rotate' && selected) {
+    // qualquer drag rotaciona Y (sem precisar acertar o círculo gizmo)
+    const hit = pickAny(e.clientX, e.clientY);
+    if (hit && hit.kind === selected.kind && hit.idx === selected.idx) {
+      startRotateDrag(e.clientX);
+      return;
+    }
+    // clicou em outro item ou vazio → deseleciona/seleciona normalmente
+  }
+  const axis = pickGizmoAxis(e.clientX, e.clientY);
+  if (axis !== null) { startGizmoDrag(axis, e.clientX, e.clientY); return; }
+  const hit = pickAny(e.clientX, e.clientY);
+  if (hit !== null) { selected = hit; return; }
+  selected = null;
   dragging = true; lastX = e.clientX; lastY = e.clientY;
 });
 window.addEventListener('mouseup', e => {
   dragging = false;
-  if (placePhase === 'xz') placeFinalizeXZ(e.clientY);
+  if (isRotating)             { endRotateDrag(); return; }
+  if (gizmoDragAxis !== null) { endGizmoDrag(); return; }
+  if (placeKind === 'box' && placePhase === 'xz')             placeFinalizeXZ(e.clientY);
+  else if (placeKind === 'quad-light' && placePhase === 'xz') placeQuadCommit();
 });
 window.addEventListener('mousemove', e => {
+  if (isRotating)              { updateRotateDrag(e.clientX); return; }
+  if (gizmoDragAxis !== null)  { updateGizmoDrag(e.clientX, e.clientY); return; }
   if (placePhase === 'xz')     { placeMoveXZ(e.clientX, e.clientY); return; }
   if (placePhase === 'height') { placeUpdateHeight(e.clientY);      return; }
   if (!dragging) return;
@@ -798,20 +1014,516 @@ window.addEventListener('mousemove', e => {
   lastX = e.clientX; lastY = e.clientY;
 });
 
-// ---------- editor: drag-and-drop de boxes primitivas ----------
-// Desktop (mouse): 3 fases — idle → xz (drag p/ retângulo no chão) → height
-// (move mouse vertical p/ altura) → click commita.
-// Touch: comportamento simplificado — drag = posição XZ, release = commit
-// com altura padrão 1m (não dá pra ter "click again" sem cursor).
-let placeMode = false;
+// ---------- caverna voxel-based (1×1×1m) ----------
+// caveVoxels = Set de "i,j,k" representando voxels VAZIOS (espaço onde
+// player anda). Tudo fora é sólido (caverna infinita).
+// Voxel(i,j,k) ocupa world: [(i-0.5), j, (k-0.5)] .. [(i+0.5), j+1, (k+0.5)]
+const caveVoxels = new Set();
+const caveSceneEntries = []; // refs no scene[] pra cleanup
+const CAVE_ALB = [0.32, 0.28, 0.22];
+const CAVE_RGB = [82, 71, 56];
+const VOXEL_FACES = [
+  // d=offset do vizinho; corners = coord local (0..1)^3 ordered CCW pra normal apontar -d (pro vazio)
+  { d: [-1, 0, 0], corners: [[0,0,0], [0,1,0], [0,1,1], [0,0,1]] },  // -x
+  { d: [+1, 0, 0], corners: [[1,0,0], [1,0,1], [1,1,1], [1,1,0]] },  // +x
+  { d: [0, -1, 0], corners: [[0,0,0], [0,0,1], [1,0,1], [1,0,0]] },  // -y (chão)
+  { d: [0, +1, 0], corners: [[0,1,0], [1,1,0], [1,1,1], [0,1,1]] },  // +y (teto)
+  { d: [0, 0, -1], corners: [[0,0,0], [1,0,0], [1,1,0], [0,1,0]] },  // -z
+  { d: [0, 0, +1], corners: [[0,0,1], [0,1,1], [1,1,1], [1,0,1]] },  // +z
+];
+function voxelKey(i, j, k) { return `${i},${j},${k}`; }
+function isEmptyVoxel(i, j, k) { return caveVoxels.has(voxelKey(i, j, k)); }
+function worldToVoxel(p) {
+  return [Math.round(p[0]), Math.floor(p[1]), Math.round(p[2])];
+}
+
+function initCaveVoxels() {
+  caveVoxels.clear();
+  for (let i = -1; i <= 1; i++)
+    for (let j = 0; j <= 1; j++)
+      for (let k = -1; k <= 1; k++)
+        caveVoxels.add(voxelKey(i, j, k));
+}
+
+// regenera scene[] entries + tris no allTris pras paredes da cave.
+// NÃO chama rebuildBVH — caller (rebuildAll) faz uma vez no fim.
+function generateCaveGeometry() {
+  for (const e of caveSceneEntries) {
+    const idx = scene.indexOf(e);
+    if (idx !== -1) scene.splice(idx, 1);
+  }
+  caveSceneEntries.length = 0;
+  for (const key of caveVoxels) {
+    const [i, j, k] = key.split(',').map(Number);
+    const wx = i - 0.5, wy = j, wz = k - 0.5;
+    for (const face of VOXEL_FACES) {
+      const ni = i + face.d[0], nj = j + face.d[1], nk = k + face.d[2];
+      if (isEmptyVoxel(ni, nj, nk)) continue; // vizinho vazio → não emite face
+      const corners = face.corners.map(([lx, ly, lz]) => [wx+lx, wy+ly, wz+lz]);
+      const entry = {
+        verts: corners,
+        edges: [[0,1],[1,2],[2,3],[3,0]],
+        tris: [[0,1,2],[0,2,3]],
+        rgb: CAVE_RGB,
+        roomId: 'cave',
+        kind: 'quad',
+        voxelOrigin: [i, j, k], // pra pickCaveFace + breakBlock identificar vizinho sólido
+        faceD: face.d,
+      };
+      scene.push(entry);
+      caveSceneEntries.push(entry);
+      addRuntimeQuad(corners[0], corners[1], corners[2], corners[3], CAVE_ALB);
+    }
+  }
+}
+
+// reconstrói TUDO em runtime: cave + placed objects. 1 rebuild de BVH no fim.
+function rebuildAll() {
+  clearRuntimeBoxes();
+  clearRuntimeLights();
+  generateCaveGeometry();
+  for (const b of placedBoxes) {
+    const verts = boxVertsFor(b.center, b.halfExtents, b.rotY);
+    pushRuntimeBoxFromVerts(verts, b.albedo);
+  }
+  for (const q of placedQuadLights) {
+    const c = quadCornersFor(q.center, q.hx, q.hz, q.rotY);
+    addRuntimeQuadLight(c[0], c[1], c[2], c[3], q.emission);
+  }
+  for (const s of placedSphereLights) {
+    addRuntimeSphereLight(s.center, s.r, s.emission);
+  }
+  rebuildRuntimeBVH();
+}
+
+// ---------- objetos placed (selecionáveis, movíveis, rotacionáveis) ----------
+// Box: armazenado como {center, halfExtents, rotY} → 8 corners derivados.
+// Quad light: {center, hx, hz, rotY} → 4 corners derivados, normal sempre -y.
+// Sphere light: {center, r}, sem rotação (radial).
+const placedBoxes        = []; // [{ entry, center, halfExtents, rotY, albedo }]
+const placedQuadLights   = []; // [{ entry, center, hx, hz, rotY, emission }]
+const placedSphereLights = []; // [{ entry, center, r, emission }]
+let selected = null;
+let transformMode = 'move';     // 'move' | 'rotate'
+let gizmoDragAxis = null;
+let gizmoDragInitialT = 0;
+let gizmoDragOriginal = null;
+let isRotating = false;
+let rotateStartX = 0;
+let rotateOriginalY = 0;
+const AXIS_LENGTH = 1.0;
+const GIZMO_PICK_PX = 14;
+const ROT_SNAP = Math.PI / 36;  // 5° de snap
+const ROT_SENS = 0.012;         // rad por pixel
+
+const AXIS_DIRS = [[1,0,0], [0,1,0], [0,0,1]];
+const AXIS_COLORS = ['rgb(255,80,80)', 'rgb(80,230,80)', 'rgb(80,150,255)'];
+
+function getSelectedItem() {
+  if (!selected) return null;
+  if (selected.kind === 'box')          return placedBoxes[selected.idx];
+  if (selected.kind === 'quad-light')   return placedQuadLights[selected.idx];
+  if (selected.kind === 'sphere-light') return placedSphereLights[selected.idx];
+  return null;
+}
+function getSelectedCenter() {
+  const it = getSelectedItem();
+  return it ? it.center.slice() : null;
+}
+
+// 8 corners de um box rotacionado (rotY) em torno de center
+function boxVertsFor(c, h, rotY) {
+  const cosA = Math.cos(rotY), sinA = Math.sin(rotY);
+  const verts = [];
+  const signs = [
+    [-1,-1,-1], [+1,-1,-1], [+1,+1,-1], [-1,+1,-1],
+    [-1,-1,+1], [+1,-1,+1], [+1,+1,+1], [-1,+1,+1],
+  ];
+  for (const [sx, sy, sz] of signs) {
+    const lx = sx * h[0], ly = sy * h[1], lz = sz * h[2];
+    const wx = lx * cosA + lz * sinA;
+    const wz = -lx * sinA + lz * cosA;
+    verts.push([c[0] + wx, c[1] + ly, c[2] + wz]);
+  }
+  return verts;
+}
+
+// 4 corners de um quad light rotacionado em torno de center.y
+function quadCornersFor(c, hx, hz, rotY) {
+  const cosA = Math.cos(rotY), sinA = Math.sin(rotY);
+  const corners = [[-hx,-hz],[+hx,-hz],[+hx,+hz],[-hx,+hz]];
+  return corners.map(([lx, lz]) => {
+    const wx = lx * cosA + lz * sinA;
+    const wz = -lx * sinA + lz * cosA;
+    return [c[0] + wx, c[1], c[2] + wz];
+  });
+}
+
+const BOX_GEOM_TEMPLATE = boxGeom([0,0,0], [1,1,1]); // edges/tris fixas
+function vertsAABB(verts) {
+  const mn = [Infinity, Infinity, Infinity];
+  const mx = [-Infinity, -Infinity, -Infinity];
+  for (const v of verts) for (let i = 0; i < 3; i++) {
+    if (v[i] < mn[i]) mn[i] = v[i];
+    if (v[i] > mx[i]) mx[i] = v[i];
+  }
+  return [mn, mx];
+}
+function makeBoxEntryFromVerts(verts, albedo) {
+  const [boxMin, boxMax] = vertsAABB(verts);
+  return {
+    verts,
+    edges: BOX_GEOM_TEMPLATE.edges,
+    tris:  BOX_GEOM_TEMPLATE.tris,
+    rgb: [Math.round(albedo[0]*255), Math.round(albedo[1]*255), Math.round(albedo[2]*255)],
+    roomId: 'editor', kind: 'box',
+    boxMin, boxMax,
+  };
+}
+
+// regenera entry visual + tris raytrace de um box
+function refreshBoxEntry(b) {
+  const verts = boxVertsFor(b.center, b.halfExtents, b.rotY);
+  Object.assign(b.entry, makeBoxEntryFromVerts(verts, b.albedo));
+}
+function refreshQuadEntry(q) {
+  const c = quadCornersFor(q.center, q.hx, q.hz, q.rotY);
+  Object.assign(q.entry, makeQuadLightEntry(c[0], c[1], c[2], c[3]));
+}
+function refreshSphereEntry(s) {
+  Object.assign(s.entry, makeSphereLightEntry(s.center, s.r));
+}
+
+function getWorldRay(mx, my) {
+  const m = matMul(rotY(yaw), rotX(pitch));
+  const fwd   = matVec(m, [0, 0, -1, 0]).slice(0, 3);
+  const right = matVec(m, [1, 0,  0, 0]).slice(0, 3);
+  const up    = matVec(m, [0, 1,  0, 0]).slice(0, 3);
+  const t = Math.tan(fov/2);
+  const ndcX = (2*mx/W - 1) * aspect * t;
+  const ndcY = (1 - 2*my/H) * t;
+  let dx = fwd[0] + ndcX*right[0] + ndcY*up[0];
+  let dy = fwd[1] + ndcX*right[1] + ndcY*up[1];
+  let dz = fwd[2] + ndcX*right[2] + ndcY*up[2];
+  const dl = Math.hypot(dx, dy, dz);
+  return [camPos.slice(), [dx/dl, dy/dl, dz/dl]];
+}
+
+function rayBoxT(ro, rd, boxMin, boxMax) {
+  let tmin = -Infinity, tmax = Infinity;
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(rd[i]) < 1e-9) {
+      if (ro[i] < boxMin[i] || ro[i] > boxMax[i]) return Infinity;
+      continue;
+    }
+    const inv = 1/rd[i];
+    let t1 = (boxMin[i] - ro[i]) * inv;
+    let t2 = (boxMax[i] - ro[i]) * inv;
+    if (t1 > t2) [t1, t2] = [t2, t1];
+    tmin = Math.max(tmin, t1);
+    tmax = Math.min(tmax, t2);
+  }
+  if (tmax < 0 || tmin > tmax) return Infinity;
+  return tmin > 0 ? tmin : tmax;
+}
+
+// Möller-Trumbore: t da intersecção raio-tri (Infinity se miss)
+function rayTriT(ro, rd, v0, v1, v2) {
+  const e1x = v1[0]-v0[0], e1y = v1[1]-v0[1], e1z = v1[2]-v0[2];
+  const e2x = v2[0]-v0[0], e2y = v2[1]-v0[1], e2z = v2[2]-v0[2];
+  const hx = rd[1]*e2z - rd[2]*e2y;
+  const hy = rd[2]*e2x - rd[0]*e2z;
+  const hz = rd[0]*e2y - rd[1]*e2x;
+  const a = e1x*hx + e1y*hy + e1z*hz;
+  if (a > -1e-9 && a < 1e-9) return Infinity;
+  const f = 1 / a;
+  const sx = ro[0]-v0[0], sy = ro[1]-v0[1], sz = ro[2]-v0[2];
+  const u = f * (sx*hx + sy*hy + sz*hz);
+  if (u < 0 || u > 1) return Infinity;
+  const qx = sy*e1z - sz*e1y;
+  const qy = sz*e1x - sx*e1z;
+  const qz = sx*e1y - sy*e1x;
+  const v = f * (rd[0]*qx + rd[1]*qy + rd[2]*qz);
+  if (v < 0 || u + v > 1) return Infinity;
+  const t = f * (e2x*qx + e2y*qy + e2z*qz);
+  return t > 1e-4 ? t : Infinity;
+}
+
+function pickCaveFace(mx, my) {
+  const [O, R] = getWorldRay(mx, my);
+  let bestT = Infinity, bestEntry = null;
+  for (const e of caveSceneEntries) {
+    const v = e.verts;
+    const t = Math.min(rayTriT(O, R, v[0], v[1], v[2]), rayTriT(O, R, v[0], v[2], v[3]));
+    if (t < bestT) { bestT = t; bestEntry = e; }
+  }
+  return bestEntry;
+}
+
+function breakBlock(mx, my) {
+  const e = pickCaveFace(mx, my);
+  if (!e) return;
+  const [i, j, k] = e.voxelOrigin;
+  const [dx, dy, dz] = e.faceD;
+  const ni = i + dx, nj = j + dy, nk = k + dz;
+  // não permita quebrar voxel abaixo do nível do chão atual
+  if (nj < 0) return;
+  caveVoxels.add(voxelKey(ni, nj, nk));
+  rebuildAll();
+}
+
+function raySphereT(ro, rd, c, r) {
+  const ox = ro[0]-c[0], oy = ro[1]-c[1], oz = ro[2]-c[2];
+  const b = ox*rd[0] + oy*rd[1] + oz*rd[2];
+  const k = ox*ox + oy*oy + oz*oz - r*r;
+  const disc = b*b - k;
+  if (disc < 0) return Infinity;
+  const sd = Math.sqrt(disc);
+  let t = -b - sd;
+  if (t < 1e-4) t = -b + sd;
+  return t > 1e-4 ? t : Infinity;
+}
+
+function pickAny(mx, my) {
+  const [O, R] = getWorldRay(mx, my);
+  let best = null, bestT = Infinity;
+  for (let i = 0; i < placedBoxes.length; i++) {
+    const e = placedBoxes[i].entry;
+    const t = rayBoxT(O, R, e.boxMin, e.boxMax); // AABB derivado dos verts (loose pra rotacionados)
+    if (t < bestT) { bestT = t; best = { kind: 'box', idx: i }; }
+  }
+  const PAD = 0.1;
+  for (let i = 0; i < placedQuadLights.length; i++) {
+    const q = placedQuadLights[i];
+    const verts = q.entry.verts;
+    const xs = [verts[0][0],verts[1][0],verts[2][0],verts[3][0]];
+    const ys = [verts[0][1],verts[1][1],verts[2][1],verts[3][1]];
+    const zs = [verts[0][2],verts[1][2],verts[2][2],verts[3][2]];
+    const min = [Math.min(...xs)-PAD, Math.min(...ys)-PAD, Math.min(...zs)-PAD];
+    const max = [Math.max(...xs)+PAD, Math.max(...ys)+PAD, Math.max(...zs)+PAD];
+    const t = rayBoxT(O, R, min, max);
+    if (t < bestT) { bestT = t; best = { kind: 'quad-light', idx: i }; }
+  }
+  for (let i = 0; i < placedSphereLights.length; i++) {
+    const sl = placedSphereLights[i];
+    const t = raySphereT(O, R, sl.center, Math.max(sl.r, 0.2));
+    if (t < bestT) { bestT = t; best = { kind: 'sphere-light', idx: i }; }
+  }
+  return best;
+}
+
+function pointToSegmentDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx*dx + dy*dy;
+  if (len2 < 1e-6) return Math.hypot(px-ax, py-ay);
+  let t = ((px - ax)*dx + (py - ay)*dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t*dx, cy = ay + t*dy;
+  return Math.hypot(px - cx, py - cy);
+}
+
+function currentViewMatrix() {
+  return matMul(matMul(rotX(-pitch), rotY(-yaw)),
+                translate(-camPos[0], -camPos[1], -camPos[2]));
+}
+function pickGizmoAxis(mx, my) {
+  if (!selected) return null;
+  const view = currentViewMatrix();
+  const c = getSelectedCenter();
+  if (!c) return null;
+  const projC = project(matVec(view, [c[0], c[1], c[2], 1]));
+  if (!projC) return null;
+  let bestAxis = null, bestDist = GIZMO_PICK_PX;
+  for (let i = 0; i < 3; i++) {
+    const ep = [c[0] + AXIS_LENGTH*AXIS_DIRS[i][0],
+                c[1] + AXIS_LENGTH*AXIS_DIRS[i][1],
+                c[2] + AXIS_LENGTH*AXIS_DIRS[i][2]];
+    const projE = project(matVec(view, [ep[0], ep[1], ep[2], 1]));
+    if (!projE) continue;
+    const d = pointToSegmentDist(mx, my, projC[0], projC[1], projE[0], projE[1]);
+    if (d < bestDist) { bestDist = d; bestAxis = i; }
+  }
+  return bestAxis;
+}
+
+// closest point on line P+t*D to ray O+s*R, returns t (or null se paralelos)
+function closestTOnLineToRay(P, D, O, R) {
+  const w0x = P[0]-O[0], w0y = P[1]-O[1], w0z = P[2]-O[2];
+  const b = D[0]*R[0] + D[1]*R[1] + D[2]*R[2];
+  const d = D[0]*w0x + D[1]*w0y + D[2]*w0z;
+  const e = R[0]*w0x + R[1]*w0y + R[2]*w0z;
+  const denom = 1 - b*b;
+  if (Math.abs(denom) < 1e-4) return null;
+  return (b*e - d) / denom;
+}
+
+function startGizmoDrag(axis, mx, my) {
+  if (!selected) return;
+  gizmoDragAxis = axis;
+  const center = getSelectedCenter();
+  const [O, R] = getWorldRay(mx, my);
+  const t = closestTOnLineToRay(center, AXIS_DIRS[axis], O, R);
+  if (t === null) { gizmoDragAxis = null; return; }
+  gizmoDragInitialT = t;
+  const it = getSelectedItem();
+  gizmoDragOriginal = { center: it.center.slice() };
+}
+
+function updateGizmoDrag(mx, my) {
+  if (gizmoDragAxis === null || !selected) return;
+  const D = AXIS_DIRS[gizmoDragAxis];
+  const cOrig = gizmoDragOriginal.center;
+  const [O, R] = getWorldRay(mx, my);
+  const t = closestTOnLineToRay(cOrig, D, O, R);
+  if (t === null) return;
+  let delta = t - gizmoDragInitialT;
+  delta = Math.round(delta / SNAP) * SNAP;
+  const dx = D[0]*delta, dy = D[1]*delta, dz = D[2]*delta;
+  const it = getSelectedItem();
+  let newC = [cOrig[0]+dx, cOrig[1]+dy, cOrig[2]+dz];
+  // clamp Y por tipo
+  if (selected.kind === 'box') {
+    if (newC[1] - it.halfExtents[1] < 0) newC[1] = it.halfExtents[1];
+    it.center = newC;
+    refreshBoxEntry(it);
+  } else if (selected.kind === 'quad-light') {
+    if (newC[1] < 0.05) newC[1] = 0.05;
+    it.center = newC;
+    refreshQuadEntry(it);
+  } else if (selected.kind === 'sphere-light') {
+    if (newC[1] < it.r) newC[1] = it.r;
+    it.center = newC;
+    refreshSphereEntry(it);
+  }
+}
+
+function endGizmoDrag() {
+  if (gizmoDragAxis === null) return;
+  rebuildAll();
+  gizmoDragAxis = null;
+  gizmoDragOriginal = null;
+}
+
+// rotação Y (transformMode === 'rotate')
+function startRotateDrag(mx) {
+  if (!selected || selected.kind === 'sphere-light') return;
+  const it = getSelectedItem();
+  rotateStartX = mx;
+  rotateOriginalY = it.rotY;
+  isRotating = true;
+}
+function updateRotateDrag(mx) {
+  if (!isRotating || !selected) return;
+  const it = getSelectedItem();
+  const dx = mx - rotateStartX;
+  const target = rotateOriginalY + dx * ROT_SENS;
+  it.rotY = Math.round(target / ROT_SNAP) * ROT_SNAP;
+  if (selected.kind === 'box')        refreshBoxEntry(it);
+  else if (selected.kind === 'quad-light') refreshQuadEntry(it);
+}
+function endRotateDrag() {
+  if (!isRotating) return;
+  rebuildAll();
+  isRotating = false;
+}
+
+function drawArrow(view, from, to, color) {
+  const pa = project(matVec(view, [from[0], from[1], from[2], 1]));
+  const pb = project(matVec(view, [to[0], to[1], to[2], 1]));
+  if (!pa || !pb) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(pa[0], pa[1]);
+  ctx.lineTo(pb[0], pb[1]);
+  ctx.stroke();
+  // ponta da seta (triângulo simples no end-point)
+  const dx = pb[0] - pa[0], dy = pb[1] - pa[1];
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return;
+  const ux = dx/len, uy = dy/len;
+  const SIZE = 10;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(pb[0], pb[1]);
+  ctx.lineTo(pb[0] - ux*SIZE - uy*SIZE*0.4, pb[1] - uy*SIZE + ux*SIZE*0.4);
+  ctx.lineTo(pb[0] - ux*SIZE + uy*SIZE*0.4, pb[1] - uy*SIZE - ux*SIZE*0.4);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawGizmo(view) {
+  if (!selected) return;
+  const it = getSelectedItem();
+  if (!it) return;
+  const c = getSelectedCenter();
+  // outline do item selecionado (amarelo)
+  const projVerts = it.entry.verts.map(p => project(matVec(view, [p[0], p[1], p[2], 1])));
+  ctx.strokeStyle = 'rgba(255,210,80,0.9)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (const [a, c2] of it.entry.edges) {
+    const pa = projVerts[a], pb = projVerts[c2];
+    if (!pa || !pb) continue;
+    ctx.moveTo(pa[0], pa[1]);
+    ctx.lineTo(pb[0], pb[1]);
+  }
+  ctx.stroke();
+
+  if (transformMode === 'move') {
+    for (let i = 0; i < 3; i++) {
+      const to = [c[0]+AXIS_LENGTH*AXIS_DIRS[i][0],
+                  c[1]+AXIS_LENGTH*AXIS_DIRS[i][1],
+                  c[2]+AXIS_LENGTH*AXIS_DIRS[i][2]];
+      drawArrow(view, c, to, AXIS_COLORS[i]);
+    }
+  } else if (transformMode === 'rotate') {
+    // círculo no plano XZ em torno do centro (raio 1m)
+    if (selected.kind === 'sphere-light') return; // sphere não rotaciona
+    ctx.strokeStyle = AXIS_COLORS[1]; // verde (eixo Y)
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const SEGS = 48, R = 1.0;
+    let lastP = null;
+    for (let i = 0; i <= SEGS; i++) {
+      const ang = (i / SEGS) * 2 * Math.PI;
+      const p = project(matVec(view, [c[0]+R*Math.cos(ang), c[1], c[2]+R*Math.sin(ang), 1]));
+      if (p) {
+        if (lastP) { ctx.moveTo(lastP[0], lastP[1]); ctx.lineTo(p[0], p[1]); }
+      }
+      lastP = p;
+    }
+    ctx.stroke();
+  }
+}
+
+// ---------- editor: drag-and-drop de primitivas (box, quad-light, sphere-light) ----------
+// Box (3 fases): xz drag → height drag → click commita
+// Quad light (1 fase): xz drag → release commita (altura fixa 2.5m)
+// Sphere light (0 fases): click commita imediato (1.5m altura, raio 0.15m)
+let placeKind  = null;       // null | 'box' | 'quad-light' | 'sphere-light'
 let placePhase = 'idle';     // 'idle' | 'xz' | 'height'
 let placingBox = null;       // ref no scene[] enquanto desenha
-let cornerA = null, cornerB = null; // pontos no chão (XZ)
-let placingHeight = 0.1;
-let heightStartY = 0;        // mouseY de referência ao entrar em 'height'
+// cornerA/B em ÍNDICES INTEIROS de célula (não em metros). Comparações
+// exatas; converte pra coords via cellToCoord. Evita drift de float.
+let cornerA = null, cornerB = null;
+let placingCellsH = 1;       // altura em células (mín 1 = 10cm)
+let heightStartY = 0;
+let heightBaselineCells = 1;
 const PLACE_RGB = [115, 178, 217];
 const PLACE_ALB = [0.45, 0.70, 0.85];
-const HEIGHT_PX_PER_M = 60;  // sensibilidade: 60px de movimento = 1m
+const QUAD_LIGHT_Y = 2.5;
+const QUAD_LIGHT_EMISSION = [16, 13, 8];
+const QUAD_LIGHT_RGB = [255, 230, 180];
+const SPHERE_LIGHT_Y = 1.5;
+const SPHERE_LIGHT_R = 0.15;
+const SPHERE_LIGHT_EMISSION = [12, 9, 5];
+const SPHERE_LIGHT_RGB = [255, 220, 150];
+const HEIGHT_PX_PER_M = 60;
+const SNAP = 0.1;
+const PX_PER_CELL = HEIGHT_PX_PER_M * SNAP; // 6 pixels = 1 célula vertical
+const cellOf = v => Math.round(v / SNAP);
+const coordOf = c => c * SNAP;
 
 function rayToFloor(mouseX, mouseY) {
   const m = matMul(rotY(yaw), rotX(pitch));
@@ -839,12 +1551,35 @@ function makeBoxEntry(min, max) {
   };
 }
 
+function makeQuadLightEntry(p0, p1, p2, p3) {
+  const q = { p0, p1, p2, p3, rgb: QUAD_LIGHT_RGB };
+  return { ...quadEntry(q), rgb: QUAD_LIGHT_RGB, emissive: true, roomId: 'editor', kind: 'quad' };
+}
+
+function makeSphereLightEntry(c, r) {
+  return {
+    ...sphereGeom(c, r, 10, 14), rgb: SPHERE_LIGHT_RGB, emissive: true,
+    roomId: 'editor', kind: 'sphere', sphCenter: c, sphRadius: r,
+  };
+}
+
 function rebuildGhost() {
-  const x0 = Math.min(cornerA[0], cornerB[0]);
-  const x1 = Math.max(cornerA[0], cornerB[0]);
-  const z0 = Math.min(cornerA[1], cornerB[1]);
-  const z1 = Math.max(cornerA[1], cornerB[1]);
-  Object.assign(placingBox, makeBoxEntry([x0, 0, z0], [x1, placingHeight, z1]));
+  if (placeKind === 'box') {
+    const x0 = coordOf(Math.min(cornerA[0], cornerB[0]));
+    const x1 = coordOf(Math.max(cornerA[0], cornerB[0]));
+    const z0 = coordOf(Math.min(cornerA[1], cornerB[1]));
+    const z1 = coordOf(Math.max(cornerA[1], cornerB[1]));
+    const yMax = coordOf(placingCellsH);
+    Object.assign(placingBox, makeBoxEntry([x0, 0, z0], [x1, yMax, z1]));
+  } else if (placeKind === 'quad-light') {
+    const x0 = coordOf(Math.min(cornerA[0], cornerB[0]));
+    const x1 = coordOf(Math.max(cornerA[0], cornerB[0]));
+    const z0 = coordOf(Math.min(cornerA[1], cornerB[1]));
+    const z1 = coordOf(Math.max(cornerA[1], cornerB[1]));
+    const y = QUAD_LIGHT_Y;
+    Object.assign(placingBox, makeQuadLightEntry(
+      [x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]));
+  }
 }
 
 function clearGhost() {
@@ -857,10 +1592,12 @@ function clearGhost() {
 function placeStartXZ(mx, my) {
   const hit = rayToFloor(mx, my);
   if (!hit) return;
-  cornerA = [hit[0], hit[2]];
-  cornerB = [hit[0], hit[2]];
-  placingHeight = 0.05;
-  placingBox = makeBoxEntry([hit[0], 0, hit[2]], [hit[0], 0.05, hit[2]]);
+  const cx = cellOf(hit[0]), cz = cellOf(hit[2]);
+  cornerA = [cx, cz];
+  cornerB = [cx, cz];
+  placingCellsH = 1;
+  placingBox = makeBoxEntry([coordOf(cx), 0, coordOf(cz)],
+                             [coordOf(cx), SNAP, coordOf(cz)]);
   scene.push(placingBox);
   placePhase = 'xz';
 }
@@ -869,35 +1606,45 @@ function placeMoveXZ(mx, my) {
   if (!placingBox) return;
   const hit = rayToFloor(mx, my);
   if (!hit) return;
-  cornerB = [hit[0], hit[2]];
+  cornerB = [cellOf(hit[0]), cellOf(hit[2])];
   rebuildGhost();
 }
 
 function placeFinalizeXZ(my) {
   if (!placingBox) return;
-  const dx = Math.abs(cornerB[0] - cornerA[0]);
-  const dz = Math.abs(cornerB[1] - cornerA[1]);
-  if (dx < 0.1 || dz < 0.1) { // arrasto trivial → cancela
+  // diff em células (inteiros) — sem drift de float
+  const dxCells = Math.abs(cornerB[0] - cornerA[0]);
+  const dzCells = Math.abs(cornerB[1] - cornerA[1]);
+  if (dxCells === 0 || dzCells === 0) { // arrasto sem área → cancela
     clearGhost();
     placePhase = 'idle';
     return;
   }
   heightStartY = my;
-  placingHeight = Math.min(dx, dz); // altura inicial = lado mais curto
+  placingCellsH = Math.max(1, Math.min(dxCells, dzCells)); // altura = lado mais curto
+  heightBaselineCells = placingCellsH;
   rebuildGhost();
   placePhase = 'height';
 }
 
 function placeUpdateHeight(my) {
   if (!placingBox) return;
-  const dy = heightStartY - my; // mouse pra cima = +
-  placingHeight = Math.max(0.05, dy / HEIGHT_PX_PER_M);
+  const dy = heightStartY - my; // pixels (mouse pra cima = +)
+  const deltaCells = Math.round(dy / PX_PER_CELL);
+  placingCellsH = Math.max(1, heightBaselineCells + deltaCells);
   rebuildGhost();
 }
 
 function placeCommit() {
   if (!placingBox) return;
-  addRuntimeBox(placingBox.boxMin, placingBox.boxMax, PLACE_ALB);
+  const min = placingBox.boxMin.slice();
+  const max = placingBox.boxMax.slice();
+  const center = [(min[0]+max[0])/2, (min[1]+max[1])/2, (min[2]+max[2])/2];
+  const halfExtents = [(max[0]-min[0])/2, (max[1]-min[1])/2, (max[2]-min[2])/2];
+  const verts = boxVertsFor(center, halfExtents, 0);
+  Object.assign(placingBox, makeBoxEntryFromVerts(verts, PLACE_ALB));
+  placedBoxes.push({ entry: placingBox, center, halfExtents, rotY: 0, albedo: PLACE_ALB });
+  addRuntimeBoxFromVerts(verts, PLACE_ALB);
   placingBox = null;
   placePhase = 'idle';
   cornerA = cornerB = null;
@@ -909,16 +1656,185 @@ function placeCancel() {
   cornerA = cornerB = null;
 }
 
+// quad light: drag-and-drop XZ no chão, light vai pra y=2.5m
+function placeQuadStart(mx, my) {
+  const hit = rayToFloor(mx, my);
+  if (!hit) return;
+  const cx = cellOf(hit[0]), cz = cellOf(hit[2]);
+  cornerA = [cx, cz];
+  cornerB = [cx, cz];
+  const x = coordOf(cx), z = coordOf(cz), y = QUAD_LIGHT_Y;
+  placingBox = makeQuadLightEntry([x,y,z], [x,y,z], [x,y,z], [x,y,z]);
+  scene.push(placingBox);
+  placePhase = 'xz';
+}
+
+function placeQuadCommit() {
+  if (!placingBox) return;
+  const dxC = Math.abs(cornerB[0] - cornerA[0]);
+  const dzC = Math.abs(cornerB[1] - cornerA[1]);
+  if (dxC === 0 || dzC === 0) { clearGhost(); placePhase = 'idle'; return; }
+  const x0 = coordOf(Math.min(cornerA[0], cornerB[0]));
+  const x1 = coordOf(Math.max(cornerA[0], cornerB[0]));
+  const z0 = coordOf(Math.min(cornerA[1], cornerB[1]));
+  const z1 = coordOf(Math.max(cornerA[1], cornerB[1]));
+  const center = [(x0+x1)/2, QUAD_LIGHT_Y, (z0+z1)/2];
+  const hx = (x1-x0)/2, hz = (z1-z0)/2;
+  const corners = quadCornersFor(center, hx, hz, 0);
+  Object.assign(placingBox, makeQuadLightEntry(corners[0], corners[1], corners[2], corners[3]));
+  addRuntimeQuadLight(corners[0], corners[1], corners[2], corners[3], QUAD_LIGHT_EMISSION);
+  placedQuadLights.push({ entry: placingBox, center, hx, hz, rotY: 0, emission: QUAD_LIGHT_EMISSION });
+  placingBox = null;
+  placePhase = 'idle';
+  cornerA = cornerB = null;
+}
+
+// sphere light: single-click commita
+function placeSphereSingleClick(mx, my) {
+  const hit = rayToFloor(mx, my);
+  if (!hit) return;
+  const c = [coordOf(cellOf(hit[0])), SPHERE_LIGHT_Y, coordOf(cellOf(hit[2]))];
+  const entry = makeSphereLightEntry(c, SPHERE_LIGHT_R);
+  scene.push(entry);
+  addRuntimeSphereLight(c, SPHERE_LIGHT_R, SPHERE_LIGHT_EMISSION);
+  placedSphereLights.push({ entry, center: c, r: SPHERE_LIGHT_R, emission: SPHERE_LIGHT_EMISSION });
+}
+
 // ESC cancela qualquer fase intermediária
 window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && placePhase !== 'idle') placeCancel();
 });
 
+// ---------- grid no chão (y=0): 10cm minor + 1m major ----------
+// Renderiza só em wireframe/shaded. Linhas projetadas com near-plane clip
+// pra não desaparecerem quando passam por trás da câmera.
+const GRID_NEAR = 0.05;
+function drawClippedLine(view, a, b) {
+  const va = matVec(view, [a[0], a[1], a[2], 1]);
+  const vb = matVec(view, [b[0], b[1], b[2], 1]);
+  if (va[2] >= -GRID_NEAR && vb[2] >= -GRID_NEAR) return;
+  let pa = va, pb = vb;
+  if (va[2] >= -GRID_NEAR) {
+    const t = (-GRID_NEAR - vb[2]) / (va[2] - vb[2]);
+    pa = [vb[0] + t*(va[0]-vb[0]), vb[1] + t*(va[1]-vb[1]), -GRID_NEAR, 1];
+  } else if (vb[2] >= -GRID_NEAR) {
+    const t = (-GRID_NEAR - va[2]) / (vb[2] - va[2]);
+    pb = [va[0] + t*(vb[0]-va[0]), va[1] + t*(vb[1]-va[1]), -GRID_NEAR, 1];
+  }
+  const sa = project(pa);
+  const sb = project(pb);
+  if (sa && sb) {
+    ctx.moveTo(sa[0], sa[1]);
+    ctx.lineTo(sb[0], sb[1]);
+  }
+}
+function drawGridLines(view, radius, step, strokeColor) {
+  const x0 = Math.floor((camPos[0] - radius) / step) * step;
+  const x1 = Math.ceil ((camPos[0] + radius) / step) * step;
+  const z0 = Math.floor((camPos[2] - radius) / step) * step;
+  const z1 = Math.ceil ((camPos[2] + radius) / step) * step;
+  ctx.strokeStyle = strokeColor;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = x0; x <= x1 + step*0.5; x += step) drawClippedLine(view, [x, 0, z0], [x, 0, z1]);
+  for (let z = z0; z <= z1 + step*0.5; z += step) drawClippedLine(view, [x0, 0, z], [x1, 0, z]);
+  ctx.stroke();
+}
+function drawFloorGrid(view) {
+  drawGridLines(view, 6,   0.1, 'rgba(180,200,220,0.18)');  // minor (10cm)
+  drawGridLines(view, 12,  1.0, 'rgba(180,200,220,0.45)');  // major (1m)
+}
+
+// wall grid voxel-aware: pra cada cave wall face existente, desenha
+// 10 subdivisões em cada direção (10cm). O perímetro 1m é o próprio
+// edge do quad (já desenhado pelo wireframe se ativo).
+function drawWallGrid(view) {
+  if (caveSceneEntries.length > 0) {
+    drawCaveWallGrid(view);
+    return;
+  }
+  // fallback: cômodos com bounds finitos (gallery, hermitage)
+  const bounds = getActiveRoomBounds();
+  if (!bounds || Math.abs(bounds.max[0] - bounds.min[0]) > 50) return;
+  drawWallGridLines(view, bounds, 0.1, 'rgba(180,200,220,0.13)');
+  drawWallGridLines(view, bounds, 1.0, 'rgba(180,200,220,0.40)');
+}
+function drawCaveWallGrid(view) {
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(180,200,220,0.13)'; // 10cm minor
+  ctx.beginPath();
+  const N = 10;
+  for (const e of caveSceneEntries) {
+    const [p0, p1, p2, p3] = e.verts;
+    // direções da grade no espaço da face
+    const u = [(p1[0]-p0[0])/N, (p1[1]-p0[1])/N, (p1[2]-p0[2])/N];
+    const v = [(p3[0]-p0[0])/N, (p3[1]-p0[1])/N, (p3[2]-p0[2])/N];
+    for (let i = 1; i < N; i++) {
+      const a = [p0[0]+i*u[0], p0[1]+i*u[1], p0[2]+i*u[2]];
+      const b = [p3[0]+i*u[0], p3[1]+i*u[1], p3[2]+i*u[2]];
+      drawClippedLine(view, a, b);
+      const c = [p0[0]+i*v[0], p0[1]+i*v[1], p0[2]+i*v[2]];
+      const d = [p1[0]+i*v[0], p1[1]+i*v[1], p1[2]+i*v[2]];
+      drawClippedLine(view, c, d);
+    }
+  }
+  ctx.stroke();
+  // contorno 1m (perímetro de cada face) major
+  ctx.strokeStyle = 'rgba(180,200,220,0.40)';
+  ctx.beginPath();
+  for (const e of caveSceneEntries) {
+    const [p0, p1, p2, p3] = e.verts;
+    drawClippedLine(view, p0, p1);
+    drawClippedLine(view, p1, p2);
+    drawClippedLine(view, p2, p3);
+    drawClippedLine(view, p3, p0);
+  }
+  ctx.stroke();
+}
+function drawWallGridLines(view, bounds, step, color) {
+  const x0 = bounds.min[0], x1 = bounds.max[0];
+  const y0 = bounds.min[1], y1 = bounds.max[1];
+  const z0 = bounds.min[2], z1 = bounds.max[2];
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  // alinha o grid pela borda da sala (não pelo grid do mundo) — assim
+  // uma parede de 3m fica 3 blocos de 1m, não 0.5+1+1+0.5
+  const eps = step * 0.5;
+  // linhas horizontais (constant y) — paredes
+  for (let y = y0; y <= y1 + eps; y += step) {
+    drawClippedLine(view, [x0, y, z0], [x0, y, z1]); // west
+    drawClippedLine(view, [x1, y, z0], [x1, y, z1]); // east
+    drawClippedLine(view, [x0, y, z0], [x1, y, z0]); // south
+    drawClippedLine(view, [x0, y, z1], [x1, y, z1]); // north
+  }
+  // linhas em Z (constant x ou y, varying z) — paredes laterais + chão + teto
+  for (let z = z0; z <= z1 + eps; z += step) {
+    drawClippedLine(view, [x0, y0, z], [x0, y1, z]); // west
+    drawClippedLine(view, [x1, y0, z], [x1, y1, z]); // east
+    drawClippedLine(view, [x0, y0, z], [x1, y0, z]); // chão
+    drawClippedLine(view, [x0, y1, z], [x1, y1, z]); // teto
+  }
+  // linhas em X (varying x) — paredes south/north + chão + teto
+  for (let x = x0; x <= x1 + eps; x += step) {
+    drawClippedLine(view, [x, y0, z0], [x, y1, z0]); // south
+    drawClippedLine(view, [x, y0, z1], [x, y1, z1]); // north
+    drawClippedLine(view, [x, y0, z0], [x, y0, z1]); // chão
+    drawClippedLine(view, [x, y1, z0], [x, y1, z1]); // teto
+  }
+  ctx.stroke();
+}
+
 function clearAllPlaced() {
   if (placePhase !== 'idle') placeCancel();
-  scene.length = sceneOriginalLength;
-  clearRuntimeBoxes();
-  // splat layer pode ter splats de paths que bateram nas boxes — limpa.
+  // remove visual entries placed (mantém entries da cave)
+  scene.length = 0;
+  for (const e of caveSceneEntries) scene.push(e);
+  placedBoxes.length = 0;
+  placedQuadLights.length = 0;
+  placedSphereLights.length = 0;
+  selected = null;
+  rebuildAll();
   if (splatLayerCtx) splatLayerCtx.clearRect(0, 0, W, H);
 }
 
@@ -928,16 +1844,48 @@ if (btnClearEl) {
   btnClearEl.addEventListener('touchstart', e => { e.preventDefault(); clearAllPlaced(); }, { passive: false });
 }
 
-const btnPlaceEl = document.getElementById('btn-place');
-function togglePlaceMode() {
-  placeMode = !placeMode;
-  btnPlaceEl?.classList.toggle('active', placeMode);
-  document.body.style.cursor = placeMode ? 'crosshair' : '';
+const btnCursorEl      = document.getElementById('btn-cursor');
+const btnMoveEl        = document.getElementById('btn-move');
+const btnRotateEl      = document.getElementById('btn-rotate');
+const btnBreakEl       = document.getElementById('btn-break');
+const btnPlaceEl       = document.getElementById('btn-place');
+const btnQuadLightEl   = document.getElementById('btn-quad-light');
+const btnSphereLightEl = document.getElementById('btn-sphere-light');
+
+function setTransformMode(mode) {
+  transformMode = mode;
+  btnMoveEl?.classList.toggle('active',   mode === 'move');
+  btnRotateEl?.classList.toggle('active', mode === 'rotate');
 }
-if (btnPlaceEl) {
-  btnPlaceEl.addEventListener('click', togglePlaceMode);
-  btnPlaceEl.addEventListener('touchstart', e => { e.preventDefault(); togglePlaceMode(); }, { passive: false });
+function bindTransformBtn(el, mode) {
+  if (!el) return;
+  el.addEventListener('click', () => setTransformMode(mode));
+  el.addEventListener('touchstart', e => { e.preventDefault(); setTransformMode(mode); }, { passive: false });
 }
+bindTransformBtn(btnMoveEl,   'move');
+bindTransformBtn(btnRotateEl, 'rotate');
+btnMoveEl?.classList.add('active'); // default = move
+
+function setPlaceKind(kind) {
+  if (placePhase !== 'idle') placeCancel();
+  placeKind = (placeKind === kind) ? null : kind;
+  btnCursorEl?.classList.toggle('active',      placeKind === null);
+  btnPlaceEl?.classList.toggle('active',       placeKind === 'box');
+  btnQuadLightEl?.classList.toggle('active',   placeKind === 'quad-light');
+  btnSphereLightEl?.classList.toggle('active', placeKind === 'sphere-light');
+  btnBreakEl?.classList.toggle('active',       placeKind === 'break');
+  document.body.style.cursor = placeKind ? 'crosshair' : '';
+}
+function bindKindBtn(el, kind) {
+  if (!el) return;
+  el.addEventListener('click', () => setPlaceKind(kind));
+  el.addEventListener('touchstart', e => { e.preventDefault(); setPlaceKind(kind); }, { passive: false });
+}
+bindKindBtn(btnCursorEl,      null);
+bindKindBtn(btnPlaceEl,       'box');
+bindKindBtn(btnQuadLightEl,   'quad-light');
+bindKindBtn(btnSphereLightEl, 'sphere-light');
+bindKindBtn(btnBreakEl,       'break');
 
 // teclas de movimento (estado segurado, aplicado em frame() com dt)
 window.addEventListener('keydown', e => {
@@ -1006,16 +1954,15 @@ function endTouch(t) {
     joystickThumbEl.style.transform = 'translate(0,0)';
   } else if (t.identifier === placeTouchId) {
     placeTouchId = null;
-    // touch: simplificado. Se XZ for válido, usa altura padrão e commita.
     if (placePhase === 'xz' && placingBox) {
-      const dx = Math.abs(cornerB[0] - cornerA[0]);
-      const dz = Math.abs(cornerB[1] - cornerA[1]);
-      if (dx < 0.1 || dz < 0.1) {
-        placeCancel();
-      } else {
-        placingHeight = 1; // 1m default em mobile
-        rebuildGhost();
-        placeCommit();
+      if (placeKind === 'box') {
+        // mobile: usa altura padrão 1m e commita
+        const dxC = Math.abs(cornerB[0] - cornerA[0]);
+        const dzC = Math.abs(cornerB[1] - cornerA[1]);
+        if (dxC === 0 || dzC === 0) placeCancel();
+        else { placingCellsH = 10; rebuildGhost(); placeCommit(); }
+      } else if (placeKind === 'quad-light') {
+        placeQuadCommit();
       }
     }
   } else if (t.identifier === lookTouchId) {
@@ -1025,13 +1972,24 @@ function endTouch(t) {
 window.addEventListener('touchend',    e => { for (const t of e.changedTouches) endTouch(t); });
 window.addEventListener('touchcancel', e => { for (const t of e.changedTouches) endTouch(t); });
 
-// drag-pra-olhar (ou placement, se em placeMode): touches no canvas
+// drag-pra-olhar (ou placement, se em placeKind): touches no canvas
 canvas.addEventListener('touchstart', e => {
   for (const t of e.changedTouches) {
     if (t.identifier === joystickTouchId) continue;
-    if (placeMode && placeTouchId === null) {
+    if (placeKind === 'sphere-light') {
+      placeSphereSingleClick(t.clientX, t.clientY);
+      e.preventDefault();
+      break;
+    }
+    if (placeKind === 'break') {
+      breakBlock(t.clientX, t.clientY);
+      e.preventDefault();
+      break;
+    }
+    if (placeKind && placeTouchId === null) {
       placeTouchId = t.identifier;
-      placeStartXZ(t.clientX, t.clientY);
+      if (placeKind === 'box')          placeStartXZ(t.clientX, t.clientY);
+      else if (placeKind === 'quad-light') placeQuadStart(t.clientX, t.clientY);
       e.preventDefault();
       break;
     }
@@ -1060,37 +2018,61 @@ function bindHoldBtn(el, onDown, onUp) {
 bindHoldBtn(btnUpEl,   () => touchUp = true,   () => touchUp = false);
 bindHoldBtn(btnDownEl, () => touchDown = true, () => touchDown = false);
 
+// colisão voxel-aware: dado pos candidata XZ, retorna pos válida (slide).
+// Player ocupa raio r. Verifica voxels nos 4 lados (X,Z separados pra slide).
+function collideXZ(curX, curZ, newX, newZ) {
+  const r = PLAYER_RADIUS;
+  const j = Math.floor(camPos[1] / 1); // voxel de altura (eye level)
+  const ground = Math.max(0, j - 1); // também checa voxel do "torso"
+  function blockedAt(x, z) {
+    // checa voxel(s) sob raio r: testa cantos do AABB do player
+    for (const dx of [-r, +r]) for (const dz of [-r, +r]) {
+      const vi = Math.round(x + dx);
+      const vk = Math.round(z + dz);
+      // checa nos voxels j (cabeça) e ground (corpo) — se algum sólido, bloqueia
+      if (!isEmptyVoxel(vi, j, vk)) return true;
+      if (j !== ground && !isEmptyVoxel(vi, ground, vk)) return true;
+    }
+    return false;
+  }
+  // tenta X primeiro (slide ao longo de Z)
+  let okX = newX, okZ = curZ;
+  if (blockedAt(newX, curZ)) okX = curX;
+  // tenta Z (slide ao longo de X)
+  if (!blockedAt(okX, newZ)) okZ = newZ;
+  return [okX, okZ];
+}
+
 function applyMovement(dt) {
   let moved = false;
   const fast = keys.ShiftLeft || keys.ShiftRight;
-  const speed = (fast ? 12 : 4) * dt;
+  const speed = (fast ? 8 : 3) * dt;
   if (speed === 0) return false;
-  // forward/right horizontais (ignoram pitch)
   const cy = Math.cos(yaw), sy = Math.sin(yaw);
-  const fx = -sy, fz = -cy;  // forward
-  const rx = cy,  rz = -sy;  // right
-  if (keys.KeyW) { camPos[0] += fx*speed; camPos[2] += fz*speed; moved = true; }
-  if (keys.KeyS) { camPos[0] -= fx*speed; camPos[2] -= fz*speed; moved = true; }
-  if (keys.KeyD) { camPos[0] += rx*speed; camPos[2] += rz*speed; moved = true; }
-  if (keys.KeyA) { camPos[0] -= rx*speed; camPos[2] -= rz*speed; moved = true; }
-  if (keys.KeyE || keys.Space) { camPos[1] += speed; moved = true; }
-  if (keys.KeyQ) { camPos[1] -= speed; moved = true; }
-  // joystick virtual: y = forward/back, x = strafe
+  const fx = -sy, fz = -cy;
+  const rx = cy,  rz = -sy;
+  let dx = 0, dz = 0;
+  if (keys.KeyW) { dx += fx*speed; dz += fz*speed; moved = true; }
+  if (keys.KeyS) { dx -= fx*speed; dz -= fz*speed; moved = true; }
+  if (keys.KeyD) { dx += rx*speed; dz += rz*speed; moved = true; }
+  if (keys.KeyA) { dx -= rx*speed; dz -= rz*speed; moved = true; }
   if (joystickX !== 0 || joystickY !== 0) {
     const fAmt = joystickY * speed;
     const rAmt = joystickX * speed;
-    camPos[0] += fx*fAmt + rx*rAmt;
-    camPos[2] += fz*fAmt + rz*rAmt;
+    dx += fx*fAmt + rx*rAmt;
+    dz += fz*fAmt + rz*rAmt;
     moved = true;
   }
-  if (touchUp)   { camPos[1] += speed; moved = true; }
-  if (touchDown) { camPos[1] -= speed; moved = true; }
+  const [okX, okZ] = collideXZ(camPos[0], camPos[2], camPos[0]+dx, camPos[2]+dz);
+  camPos[0] = okX;
+  camPos[2] = okZ;
+  camPos[1] = PLAYER_HEIGHT;
   return moved;
 }
 window.addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') {
-    if (mode !== 'wireframe' && mode !== 'shaded') return;
-    mode = mode === 'wireframe' ? 'shaded' : 'wireframe';
+    if (mode !== 'wireframe' && mode !== 'shaded' && mode !== 'solid') return;
+    mode = mode === 'wireframe' ? 'shaded' : (mode === 'shaded' ? 'solid' : 'wireframe');
     if (modeLabel) modeLabel.textContent = mode;
   } else if (e.key === 'l' || e.key === 'L') {
     if (mode === 'pathtrace') return;
@@ -1303,16 +2285,24 @@ function frame() {
   );
   if (mode === 'wireframe')       drawWireframe(view);
   else if (mode === 'shaded')     drawShaded(view);
+  else if (mode === 'solid')      drawSolid(view);
   else if (mode === 'lighttrace') drawLightTrace(view, dt);
+  // wall grid via ctx só em wire/shaded; solid já desenha grid próprio z-buffered
+  if (mode === 'wireframe' || mode === 'shaded') drawWallGrid(view);
+  if (mode === 'wireframe' || mode === 'shaded' || mode === 'solid') drawGizmo(view);
 
   rafId = requestAnimationFrame(frame);
 }
 
 async function init() {
-  // ?scene=<id> troca cena. default = empty (sandbox); outras: hermitage-enfilade, gallery
-  const sceneId = new URLSearchParams(location.search).get('scene') || 'empty';
+  // ?scene=<id> troca cena. default = cave; outras: empty, hermitage-enfilade, gallery
+  const sceneId = new URLSearchParams(location.search).get('scene') || 'cave';
   await loadScene(`${import.meta.env.BASE_URL}scenes/${sceneId}/manifest.json`);
   buildVisualScene();
+  if (sceneId === 'cave') {
+    initCaveVoxels();
+    rebuildAll();
+  }
   sceneOriginalLength = scene.length;
   frame();
 }

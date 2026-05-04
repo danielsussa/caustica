@@ -32,9 +32,10 @@ let manifestData = null;
 const allTris = [];
 const allSphs = [];
 const allLights = [];
-// snapshot do tamanho dos arrays após loadScene — pra clearRuntimeBoxes
+// snapshots dos tamanhos de arrays após loadScene — pra clearRuntime
 // truncar de volta sem mexer na geometria da cena original.
 let sceneTriCount = 0;
+let sceneLightCount = 0;
 
 // ---------- scene loader ----------
 export async function loadScene(manifestUrl) {
@@ -60,17 +61,23 @@ export async function loadScene(manifestUrl) {
     for (const l of room.lights) allLights.push(l);
   }
   sceneTriCount = allTris.length;
+  sceneLightCount = allLights.length;
   rebuildBVH();
   activeRoom = rooms[0] || null;
   return manifestData;
 }
 
-// remove tudo que foi adicionado em runtime (via addRuntimeBox).
-// Trunca allTris pro tamanho original da cena e reconstrói o BVH.
+// boxes em runtime (truncados a partir de sceneTriCount).
 export function clearRuntimeBoxes() {
   if (allTris.length > sceneTriCount) {
     allTris.length = sceneTriCount;
     rebuildBVH();
+  }
+}
+// lights em runtime (truncados a partir de sceneLightCount).
+export function clearRuntimeLights() {
+  if (allLights.length > sceneLightCount) {
+    allLights.length = sceneLightCount;
   }
 }
 
@@ -114,25 +121,70 @@ export function getDynamicVisuals() {
   return dynamicVisual;
 }
 
-// adiciona uma box em runtime: 12 tris vão pra allTris + BVH é reconstruído.
-// Usado pelo editor de placement (drag-and-drop).
-export function addRuntimeBox(min, max, albedo) {
+// adiciona um quad light em runtime (sem afetar BVH — luzes ficam fora).
+// p0..p3 em CCW vista do lado emissivo.
+export function addRuntimeQuadLight(p0, p1, p2, p3, emission) {
+  const u = sub(p1, p0);
+  const v = sub(p3, p0);
+  const c = cross(u, v);
+  const area = Math.hypot(c[0], c[1], c[2]);
+  const n = [c[0]/area, c[1]/area, c[2]/area];
+  allLights.push({ kind: 'quad', p0, p1, p2, p3, n, area, emission });
+}
+
+// adiciona uma sphere light em runtime (sem afetar BVH).
+export function addRuntimeSphereLight(c, r, emission) {
+  allLights.push({ kind: 'sphere', c, r, emission });
+}
+
+// adiciona um quad em runtime (2 tris). Não reconstrói BVH — caller deve
+// chamar rebuildRuntimeBVH() depois de batches.
+export function addRuntimeQuad(p0, p1, p2, p3, albedo) {
   const mat = { kind: M_DIFFUSE, albedo };
-  const [x0,y0,z0] = min, [x1,y1,z1] = max;
-  const pushQuad = (p0, p1, p2, p3) => {
+  const e1 = [p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]];
+  const e2 = [p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]];
+  const n = norm(cross(e1, e2));
+  allTris.push({ v0: p0, v1: p1, v2: p2, n, mat });
+  allTris.push({ v0: p0, v1: p2, v2: p3, n, mat });
+}
+export function rebuildRuntimeBVH() { rebuildBVH(); }
+
+// 6 faces do box, índices nos verts em ordem boxGeom (corner standard order)
+const BOX_FACE_QUADS = [
+  [0, 3, 2, 1], // -z
+  [4, 5, 6, 7], // +z
+  [0, 1, 5, 4], // -y
+  [3, 7, 6, 2], // +y
+  [0, 4, 7, 3], // -x
+  [1, 2, 6, 5], // +x
+];
+
+// adiciona 12 tris (sem rebuild). Caller chama rebuildRuntimeBVH depois.
+export function pushRuntimeBoxFromVerts(verts, albedo) {
+  const mat = { kind: M_DIFFUSE, albedo };
+  for (const [a, b, c, d] of BOX_FACE_QUADS) {
+    const p0 = verts[a], p1 = verts[b], p2 = verts[c], p3 = verts[d];
     const e1 = [p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]];
     const e2 = [p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]];
     const n = norm(cross(e1, e2));
     allTris.push({ v0: p0, v1: p1, v2: p2, n, mat });
     allTris.push({ v0: p0, v1: p2, v2: p3, n, mat });
-  };
-  pushQuad([x0,y0,z0],[x0,y1,z0],[x1,y1,z0],[x1,y0,z0]);
-  pushQuad([x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]);
-  pushQuad([x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]);
-  pushQuad([x0,y1,z0],[x0,y1,z1],[x1,y1,z1],[x1,y1,z0]);
-  pushQuad([x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0]);
-  pushQuad([x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]);
+  }
+}
+// wrapper "add" rebuilda na hora (uso single-shot)
+export function addRuntimeBoxFromVerts(verts, albedo) {
+  pushRuntimeBoxFromVerts(verts, albedo);
   rebuildBVH();
+}
+
+// wrapper legacy: AABB box
+export function addRuntimeBox(min, max, albedo) {
+  const [x0,y0,z0] = min, [x1,y1,z1] = max;
+  const verts = [
+    [x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],
+    [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1],
+  ];
+  addRuntimeBoxFromVerts(verts, albedo);
 }
 
 // ---------- BVH (median-split, leaf size 4) ----------
@@ -287,6 +339,7 @@ export function setActiveRoomByPos(pos) {
 }
 
 export function getActiveRoomId() { return activeRoom?.id ?? null; }
+export function getActiveRoomBounds() { return activeRoom?.bounds ?? null; }
 
 // ---------- interseção ----------
 function intersectTri(tri, ro, rd) {

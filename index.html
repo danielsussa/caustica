@@ -47,21 +47,34 @@
   #btn-params.visible { display: flex; }
   .vbtn.pressed { background: rgba(255,255,255,0.20); }
   .vbtn.active  { background: rgba(255,200,120,0.35); border-color: rgba(255,200,120,0.6); }
-  #btn-place, #btn-clear {
+  #btn-cursor, #btn-move, #btn-rotate, #btn-break, #btn-place, #btn-clear, #btn-quad-light, #btn-sphere-light {
     position: fixed; left: 12px;
-    width: 56px; height: 56px;
-    background: rgba(255,255,255,0.08);
-    border: 1px solid rgba(255,255,255,0.20);
-    border-radius: 8px;
-    color: #ddd; font-size: 13px; font-family: inherit;
+    width: 32px; height: 32px;
+    color: rgba(220,225,230,0.55);
     display: flex; align-items: center; justify-content: center;
     cursor: pointer; z-index: 10;
     touch-action: none; -webkit-user-select: none; user-select: none;
+    transition: color 0.12s;
   }
-  #btn-place { top: 12px; }
-  #btn-clear { top: 76px; }
-  #btn-place.active { background: rgba(115,178,217,0.35); border-color: rgba(115,178,217,0.7); }
-  #btn-place svg, #btn-clear svg { width: 24px; height: 24px; pointer-events: none; }
+  #btn-cursor:hover, #btn-move:hover, #btn-rotate:hover, #btn-break:hover, #btn-place:hover, #btn-clear:hover, #btn-quad-light:hover, #btn-sphere-light:hover {
+    color: rgba(255,255,255,0.95);
+  }
+  #btn-cursor       { top: 12px; }
+  #btn-move         { top: 48px; }
+  #btn-rotate       { top: 84px; }
+  #btn-break        { top: 132px; }
+  #btn-place        { top: 180px; }
+  #btn-quad-light   { top: 216px; }
+  #btn-sphere-light { top: 252px; }
+  #btn-clear        { top: 300px; }
+  #btn-cursor.active, #btn-place.active, #btn-quad-light.active, #btn-sphere-light.active {
+    color: rgba(255,200,120,1);
+  }
+  #btn-move.active, #btn-rotate.active { color: rgba(115,178,217,1); }
+  #btn-break.active { color: rgba(220,120,80,1); }
+  #btn-cursor svg, #btn-move svg, #btn-rotate svg, #btn-break svg, #btn-place svg, #btn-clear svg, #btn-quad-light svg, #btn-sphere-light svg {
+    width: 22px; height: 22px; pointer-events: none;
+  }
   /* esconde controles touch em desktops com mouse — escolha de UI: deixar
      sempre visíveis pra ser óbvio que existem. Pode trocar pra @media. */
   .hud {
@@ -99,10 +112,38 @@
 <body>
   <canvas id="screen"></canvas>
   <div id="joystick"><div id="joystick-thumb"></div></div>
-  <div class="vbtn" id="btn-up">↑</div>
-  <div class="vbtn" id="btn-down">↓</div>
+  <!-- btn-up/down escondidos: cena padrão (cave) é no-fly -->
+  <div class="vbtn" id="btn-up" style="display:none">↑</div>
+  <div class="vbtn" id="btn-down" style="display:none">↓</div>
   <div class="vbtn" id="btn-l">L</div>
   <div class="vbtn" id="btn-params">≡</div>
+  <div id="btn-cursor" class="active" title="movimento de câmera (sem placement)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/>
+    </svg>
+  </div>
+  <div id="btn-move" title="mover (translate)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="5 9 2 12 5 15"/>
+      <polyline points="9 5 12 2 15 5"/>
+      <polyline points="15 19 12 22 9 19"/>
+      <polyline points="19 9 22 12 19 15"/>
+      <line x1="2" x2="22" y1="12" y2="12"/>
+      <line x1="12" x2="12" y1="2" y2="22"/>
+    </svg>
+  </div>
+  <div id="btn-rotate" title="rotacionar (Y axis)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12a9 9 0 1 1-3-6.7L21 8"/>
+      <path d="M21 3v5h-5"/>
+    </svg>
+  </div>
+  <div id="btn-break" title="quebrar bloco (caverna)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m14 12-8.5 8.5a2.12 2.12 0 0 1-3-3L11 9"/>
+      <path d="M15 13 9 7l4-4 6 6h3a8 8 0 0 1-7 7z"/>
+    </svg>
+  </div>
   <div id="btn-place" title="adicionar box">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M16 16h6"/><path d="M19 13v6"/>
@@ -110,7 +151,24 @@
       <path d="M16.5 9.4 7.55 4.24"/><path d="M3.29 7 12 12l8.71-5"/><path d="M12 22V12"/>
     </svg>
   </div>
-  <div id="btn-clear" title="limpar boxes adicionadas">
+  <div id="btn-quad-light" title="adicionar luz plana">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="5" width="18" height="6" rx="1"/>
+      <line x1="6"  y1="14" x2="6"  y2="16"/>
+      <line x1="10" y1="14" x2="10" y2="17"/>
+      <line x1="12" y1="14" x2="12" y2="18"/>
+      <line x1="14" y1="14" x2="14" y2="17"/>
+      <line x1="18" y1="14" x2="18" y2="16"/>
+    </svg>
+  </div>
+  <div id="btn-sphere-light" title="adicionar luz esférica">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/>
+      <path d="M9 18h6"/>
+      <path d="M10 22h4"/>
+    </svg>
+  </div>
+  <div id="btn-clear" title="limpar tudo adicionado">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M3 6h18"/>
       <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
@@ -120,7 +178,7 @@
     </svg>
   </div>
   <div class="hud">
-    modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wireframe/shaded · <b>L</b> lighttrace · <b>R</b> path tracer · <b>WASD</b> · <b>Q/E</b> ou ↑↓ · drag/touch pra olhar · fps: <b id="fps">--</b><span id="samples-info" style="display:none"> · samples: <b id="samples">0</b></span>
+    modo: <span id="mode-label">wireframe</span> · cômodo: <b id="room-label">A</b> · <b>M</b> wire/shaded/solid · <b>L</b> lighttrace · <b>R</b> path tracer · <b>WASD</b> · <b>Q/E</b> ou ↑↓ · drag/touch pra olhar · fps: <b id="fps">--</b><span id="samples-info" style="display:none"> · samples: <b id="samples">0</b></span>
   </div>
   <div id="lt-panel">
     <h4>lighttrace params</h4>
