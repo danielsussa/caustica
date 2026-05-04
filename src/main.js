@@ -11,12 +11,17 @@ const canvas = document.getElementById('screen');
 const ctx = canvas.getContext('2d');
 const modeLabel = document.getElementById('mode-label');
 let W = 0, H = 0, aspect = 1;
+let renderScale = 1.0; // 1.0 = 100%, < 1 renderiza menor e CSS escala (ganho de perf)
 
 function resize() {
-  W = window.innerWidth;
-  H = window.innerHeight;
+  const cssW = window.innerWidth;
+  const cssH = window.innerHeight;
+  W = Math.max(1, Math.floor(cssW * renderScale));
+  H = Math.max(1, Math.floor(cssH * renderScale));
   canvas.width = W;
   canvas.height = H;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
   aspect = W / H;
   imageData = null; // força recriar buffer
 }
@@ -383,6 +388,8 @@ let ltLineFirstOnly = false;
 let ltGaussian      = false;
 let ltFramesPerBounce = 1; // 1 = instant, N = cada bounce demora N frames pra aparecer
 let ltMaxLinesOnScreen = 1500; // cap de paths cujas LINHAS são rasterizadas/frame
+let ltAutoPerf = true;          // auto-ajusta ltPathsPerFrame baseado em FPS
+let ltAutoPerfCap = 40;          // valor dinâmico (cap atual de paths/frame em auto)
 let contourPower = 0; // 0..1, controlado dinamicamente
 let ltPhysicalDecay = true;
 let ltEmissionVar   = 0.7;   // 0 = todos fótons saem com energia 1; 1 = uniform [0, 2]
@@ -587,7 +594,15 @@ function drawLightTrace(view, dt) {
 
   // adiciona N caminhos novos no ring buffer
   resetIntersectCounters();
-  for (let i = 0; i < ltPathsPerFrame; i++) {
+  // adaptive perf: ajusta cap baseado em FPS (alvos: 40 floor, 55 ceiling)
+  if (ltAutoPerf) {
+    if (fpsEMA < 40)      ltAutoPerfCap = Math.max(3, ltAutoPerfCap * 0.94);
+    else if (fpsEMA > 55) ltAutoPerfCap = Math.min(ltPathsPerFrame, ltAutoPerfCap * 1.04);
+  } else {
+    ltAutoPerfCap = ltPathsPerFrame;
+  }
+  const pathsThisFrame = ltAutoPerf ? Math.min(ltPathsPerFrame, ltAutoPerfCap | 0) : ltPathsPerFrame;
+  for (let i = 0; i < pathsThisFrame; i++) {
     const p = tracePhotonPath(ltMaxBounces, ltEmissionVar, ltPhysicalDecay);
     if (p.points.length >= 2) appendPhotonPath(p.points, p.colors, p.intensities);
   }
@@ -2353,6 +2368,11 @@ bindCheckbox('lt-bvh',         v => setUseBVH(v));
 bindCheckbox('lt-wireframe',   v => ltShowWireframe = v);
 bindSlider('lt-emission', 'lt-emission-val', v => ltEmissionVar = v);
 bindSlider('lt-fpb',      'lt-fpb-val',      v => ltFramesPerBounce = Math.max(1, v|0));
+bindCheckbox('lt-autoperf', v => ltAutoPerf = v);
+bindSlider('lt-renderscale', 'lt-renderscale-val', v => {
+  renderScale = v;
+  resize(); // reaplica scale
+});
 bindSlider('lt-maxlines', 'lt-maxlines-val', v => ltMaxLinesOnScreen = Math.max(50, v|0));
 
 const ltResetBtn = document.getElementById('lt-reset');
