@@ -372,6 +372,9 @@ const photonLen       = new Uint8Array(MAX_PATHS);
 // pintados pra esse slot. revealedSegs = floor(age/framesPerBounce) + 1
 const photonAge        = new Uint16Array(MAX_PATHS);
 const photonSplatStage = new Uint8Array(MAX_PATHS);
+// quantos segments já foram rasterizadas no LINES LAYER pra esse slot.
+// Cada seg desenhado UMA vez na vida → custo amortizado.
+const photonLineStage  = new Uint8Array(MAX_PATHS);
 let photonHead = 0;
 let photonCount = 0;
 
@@ -415,6 +418,7 @@ function appendPhotonPath(pts, cols, intensities) {
   photonLen[slot] = n;
   photonAge[slot] = 0;
   photonSplatStage[slot] = 0;
+  photonLineStage[slot] = 0;
   photonHead = (photonHead + 1) % MAX_PATHS;
   if (photonCount < MAX_PATHS) photonCount++;
 }
@@ -649,7 +653,10 @@ function drawLightTrace(view, dt) {
     }
   }
 
-  // rasteriza segments per pixel com z-test + additive blend.
+  // LINES LAYER: acumula segments NOVOS indefinidamente. Cap de saturação
+  // por pixel (raster function) impede branco-puro. Sem fade per-frame.
+  // Lines antigas ficam como "trails de longa exposição" durante movimento.
+  ensureLinesLayer();
   const lineMaxB = ltLineFirstOnly ? Math.min(2, ltMaxBounces) : ltMaxBounces;
   const decayPow = [1, ltAlphaDecay, ltAlphaDecay*ltAlphaDecay,
                     ltAlphaDecay*ltAlphaDecay*ltAlphaDecay,
@@ -661,7 +668,8 @@ function drawLightTrace(view, dt) {
     const len = photonLen[pi];
     const ibase = pi * MAX_POINTS;
     const revealedB = Math.min(lineMaxB, Math.floor(photonAge[pi] / ltFramesPerBounce) + 1);
-    for (let b = 0; b < revealedB; b++) {
+    // só desenha segments NOVOS (b >= stage atual)
+    for (let b = photonLineStage[pi]; b < revealedB; b++) {
       if (b + 1 >= len) continue;
       const i0 = pi * MAX_POINTS + b;
       const i1 = i0 + 1;
@@ -672,9 +680,6 @@ function drawLightTrace(view, dt) {
       if (alpha < ALPHA_MIN) continue;
       let r, g, bl;
       if (ltColorByBounce) {
-        // normaliza pelo max → preserva hue do bounce mas brilho fica
-        // equivalente ao da luz (sem isso, bounces ficam dim escondidos
-        // no fundo escuro da parede shaded)
         const cidx = i0 * 3;
         const cr = photonRGB[cidx], cg = photonRGB[cidx+1], cb = photonRGB[cidx+2];
         const mx = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
@@ -689,14 +694,21 @@ function drawLightTrace(view, dt) {
       } else {
         r = 255; g = 220; bl = 140;
       }
-      rasterLineZBufBlend(
+      rasterLineToLinesLayer(
         projX[i0], projY[i0], projZ[i0],
         projX[i1], projY[i1], projZ[i1],
         r * alpha, g * alpha, bl * alpha,
       );
     }
+    photonLineStage[pi] = revealedB; // marca como desenhado
   }
+  // walls → main canvas
   ctx.putImageData(imageData, 0, 0);
+  // lines layer accumulator → linesLayer canvas → composite aditivo
+  linesCtx.putImageData(linesImageData, 0, 0);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.drawImage(linesLayer, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
 
   // wireframe opcional (overlay ctx, sem z-test)
   ctx.lineWidth = 1;
@@ -848,6 +860,60 @@ function rasterLineZBufView(va, vb, pixel) {
   else if (i0)  { pa = project(va); pb = project(clipEdgeNear(va, vb)); }
   else          { pa = project(clipEdgeNear(vb, va)); pb = project(vb); }
   rasterLineZBuf(pa, pb, pixel);
+}
+
+// LINES LAYER: canvas off-screen onde acumula segments. Cada path desenha
+// suas linhas UMA vez (tracked via photonLineStage). Composite aditivo
+// no main canvas. Em vez de re-rasterizar 6000 segs/frame, ~160 novas/frame.
+const linesLayer = document.createElement('canvas');
+let linesCtx = null, linesImageData = null, linesU32 = null;
+let linesLayerW = 0, linesLayerH = 0;
+let linesLastViewKey = null;
+function ensureLinesLayer() {
+  if (linesLayerW !== W || linesLayerH !== H) {
+    linesLayer.width = W;
+    linesLayer.height = H;
+    linesCtx = linesLayer.getContext('2d', { willReadFrequently: true });
+    linesImageData = linesCtx.createImageData(W, H);
+    linesU32 = new Uint32Array(linesImageData.data.buffer);
+    linesLayerW = W; linesLayerH = H;
+    linesLastViewKey = null;
+  }
+}
+// raster line direto no LINES buffer (com z-test contra zbuf das paredes).
+// Cap de saturação: pixel já bright não recebe mais cor (impede branco-puro
+// e mantém brilho equilibrado sem precisar fade per-frame).
+function rasterLineToLinesLayer(x0, y0, z0, x1, y1, z1, addR, addG, addB) {
+  const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+  const adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+  const steps = Math.max(1, Math.ceil(adx > ady ? adx : ady));
+  const inv = 1 / steps;
+  const stepX = dx * inv, stepY = dy * inv, stepZ = dz * inv;
+  const BIAS = 0.05;
+  const SAT_CAP = 600; // soma R+G+B máxima (~200 average por canal)
+  let cx = x0, cy = y0, cz = z0;
+  for (let i = 0; i <= steps; i++) {
+    const x = cx | 0, y = cy | 0;
+    if (x >= 0 && x < W && y >= 0 && y < H) {
+      const idx = y * W + x;
+      if (cz + BIAS >= zbuf[idx]) {
+        const cur = linesU32[idx];
+        const cR = cur & 0xff;
+        const cG = (cur >> 8) & 0xff;
+        const cB = (cur >> 16) & 0xff;
+        if (cR + cG + cB < SAT_CAP) {
+          const nR = cR + addR;
+          const nG = cG + addG;
+          const nB = cB + addB;
+          linesU32[idx] = 0xff000000
+            | ((nB > 255 ? 255 : nB | 0) << 16)
+            | ((nG > 255 ? 255 : nG | 0) << 8)
+            | (nR > 255 ? 255 : nR | 0);
+        }
+      }
+    }
+    cx += stepX; cy += stepY; cz += stepZ;
+  }
 }
 
 // rasteriza linha com z-test + additive blend per pixel.
@@ -2003,10 +2069,22 @@ function applyTool(id) {
   }
   const usesSpaceAim = placeKind === 'break' || placeKind === 'wall-lamp';
   const useCursorCrosshair = placeKind && !usesSpaceAim;
-  document.body.style.cursor = useCursorCrosshair ? 'crosshair' : 'none';
   document.getElementById('crosshair')?.classList.toggle('visible', usesSpaceAim);
-  // se entrou em placement-mode com cursor, sai do pointer lock pra ver mouse
   if (useCursorCrosshair && pointerLocked) document.exitPointerLock();
+  updateBodyCursor();
+}
+
+// cursor visível se: painel aberto OU placement com mouse. Senão hidden.
+function updateBodyCursor() {
+  // lookup direto (ltPanel const é declarado só depois — applyTool roda no init)
+  const panel = document.getElementById('lt-panel');
+  if (panel?.classList.contains('open')) {
+    document.body.style.cursor = 'default';
+    return;
+  }
+  const usesSpaceAim = placeKind === 'break' || placeKind === 'wall-lamp';
+  const useCursorCrosshair = placeKind && !usesSpaceAim;
+  document.body.style.cursor = useCursorCrosshair ? 'crosshair' : 'none';
 }
 function svgWrap(inner) {
   return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
@@ -2046,6 +2124,16 @@ window.addEventListener('keydown', e => {
     e.preventDefault();
     if (placeKind === 'break')     breakBlock(W / 2, H / 2);
     if (placeKind === 'wall-lamp') placeLampOnWall();
+  }
+  // E = toggle painel de params (e libera cursor pra interagir)
+  if (e.code === 'KeyE') {
+    e.preventDefault();
+    if (ltPanel) {
+      const willOpen = !ltPanel.classList.contains('open');
+      ltPanel.classList.toggle('open', willOpen);
+      if (willOpen && pointerLocked) document.exitPointerLock();
+      updateBodyCursor();
+    }
   }
 }, { passive: false });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
@@ -2332,6 +2420,7 @@ const btnParamsEl = document.getElementById('btn-params');
 function toggleParamsPanel() {
   if (!ltPanel || mode !== 'lighttrace') return;
   ltPanel.classList.toggle('open');
+  updateBodyCursor();
 }
 if (btnParamsEl) {
   btnParamsEl.addEventListener('click', toggleParamsPanel);
@@ -2381,7 +2470,9 @@ if (ltResetBtn) ltResetBtn.addEventListener('click', () => {
   photonCount = 0;
   photonAge.fill(0);
   photonSplatStage.fill(0);
+  photonLineStage.fill(0);
   if (splatLayerCtx) splatLayerCtx.clearRect(0, 0, W, H);
+  if (linesU32) linesU32.fill(0);
 });
 
 const ltBufferEl = document.getElementById('lt-buffer-val');
